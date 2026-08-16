@@ -205,6 +205,10 @@ bot.on("text", async (ctx) => {
     console.log(`[bridge] ignored message from non-allowed user ${fromId}`);
     return;
   }
+  if (cfg.chatOnly && chat.type !== "private") {
+    console.log(`[bridge] ignored ${chat.type} message (chat-only mode) from ${fromId}`);
+    return;
+  }
   // Long-message chunk aggregation (C14): commands go straight to route(),
   // plain text is quiet-period batched so >4096 splits arrive as one turn.
   const deliver = (text: string) => {
@@ -235,6 +239,7 @@ const TEXT_EXT = /\.(txt|md|markdown|json|log|csv|py|js|ts|tsx|jsx|go|rs|java|c|
 const MAX_INLINE_DOC_BYTES = 100_000;
 
 function mediaDeliver(chatId: number, ctx: any, text: string): void {
+  if (cfg.chatOnly && ctx.chat?.type !== "private") return;
   lastCtx.set(chatId, ctx);
   renderer.cacheContext(chatId, ctx);
   textBatcher.push(chatId, text);

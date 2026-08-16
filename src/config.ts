@@ -17,6 +17,8 @@ export interface Config {
   disableLinkPreviews: boolean;
   /** React 👀/✅/❌ to user messages while processing (default off). */
   enableReactions: boolean;
+  /** Only respond in private chats; ignore all groups/channels. */
+  chatOnly: boolean;
 }
 
 function parseIds(raw: string | undefined): number[] {
@@ -56,5 +58,6 @@ export function loadConfig(): Config {
       process.env.PLAN_MODE_PREFIX ?? "[Plan mode] Plan only, do not execute.",
     disableLinkPreviews: (process.env.DISABLE_LINK_PREVIEWS ?? "").toLowerCase() === "true",
     enableReactions: (process.env.ENABLE_REACTIONS ?? "").toLowerCase() === "true",
+    chatOnly: (process.env.TELEGRAM_CHAT_ONLY ?? "").toLowerCase() === "true",
   };
 }
