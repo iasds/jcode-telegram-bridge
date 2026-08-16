@@ -25,6 +25,8 @@ const HELP = `
 /retry Re-run your last message
 /sethome Set this chat as home channel
 /platform Platform connection status
+/background <prompt> Run in a separate background session
+/steer <text> Inject a hint between tool calls
 /restart Restart the bridge process
 /update git pull + rebuild + restart
 
@@ -297,6 +299,64 @@ export async function handleCommand(
       await reply(
         `*Platform*\nTelegram: connected (long-poll, timeout 15s)\nPoll offset: ${offset ?? "n/a"}\nActive turns: ${hooks.activeTurns ? hooks.activeTurns() : -1}`,
       );
+      return true;
+    }
+
+    case "background": {
+      if (!arg) {
+        await reply("Usage: /background <prompt> — run in a separate background session.");
+        return true;
+      }
+      const st = await store.getOrCreate(chatId);
+      try {
+        await client.attachSession(st.sessionId);
+        const bg = await client.createSession(st.workdir);
+        await client.attachSession(bg.session_id);
+        await client.sendMessage(bg.session_id, arg, { waitForAccept: false });
+        void (async () => {
+          let out = "";
+          const consume = (async () => {
+            for await (const ev of client.events(bg.session_id)) {
+              if (ev.ev === "text_delta") out += ev.text;
+              if (ev.ev === "turn_done") return;
+            }
+          })();
+          try {
+            await Promise.race([
+              consume,
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("background turn timed out (120s)")), 120_000),
+              ),
+            ]);
+            await renderer.safeSendMessage(chatId, `🔁 *Background result*\n${out.trim() || "(no output)"}`);
+          } catch (err) {
+            await renderer.safeSendMessage(chatId, `⚠️ Background failed: ${String(err)}`);
+          }
+        })();
+        await reply(`🚀 Background turn started (session \`${bg.session_id.slice(0, 16)}…\`).`);
+      } catch (err) {
+        await reply(`Background failed: ${escapeMdv2(String(err))}`);
+      }
+      return true;
+    }
+
+    case "steer": {
+      if (!arg) {
+        await reply("Usage: /steer <text> — inject a hint between tool calls.");
+        return true;
+      }
+      const st = store.get(chatId);
+      if (!st) {
+        await reply("No active session. Send a message first.");
+        return true;
+      }
+      try {
+        await client.attachSession(st.sessionId);
+        await client.softInterrupt(st.sessionId, arg);
+        await reply("🎛 Steer injected.");
+      } catch (err) {
+        await reply(`Steer failed: ${escapeMdv2(String(err))}`);
+      }
       return true;
     }
 

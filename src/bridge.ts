@@ -229,6 +229,100 @@ bot.on("text", async (ctx) => {
   }
 });
 
+// ---- Media input (C2): text documents (<=100KB) are inlined into the turn;
+// ---- other media become descriptive placeholders (model has no vision).
+const TEXT_EXT = /\.(txt|md|markdown|json|log|csv|py|js|ts|tsx|jsx|go|rs|java|c|cpp|h|hpp|sh|bash|zsh|yaml|yml|toml|ini|xml|html|css|sql|env|conf|cfg)$/i;
+const MAX_INLINE_DOC_BYTES = 100_000;
+
+function mediaDeliver(chatId: number, ctx: any, text: string): void {
+  lastCtx.set(chatId, ctx);
+  renderer.cacheContext(chatId, ctx);
+  textBatcher.push(chatId, text);
+}
+
+function fmtBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${n} B`;
+}
+
+async function handleDocument(ctx: any): Promise<void> {
+  const chatId = ctx.chat.id;
+  const fromId = ctx.from?.id;
+  if (!chatId || !allowed(fromId)) return;
+  const doc = ctx.message.document;
+  const name = doc.file_name ?? "document";
+  const size = doc.file_size ?? 0;
+  const caption = ctx.message.caption ?? "";
+  const isText =
+    TEXT_EXT.test(name) || (typeof doc.mime_type === "string" && doc.mime_type.startsWith("text/"));
+  if (!isText || size > MAX_INLINE_DOC_BYTES) {
+    mediaDeliver(
+      chatId,
+      ctx,
+      `📎 The user sent a file: ${name} (${fmtBytes(size)}).${caption ? ` Caption: ${caption}` : ""}`,
+    );
+    return;
+  }
+  try {
+    const f = await ctx.telegram.getFile(doc.file_id);
+    if (!f.file_path) throw new Error("no file_path");
+    const res = await fetch(`https://api.telegram.org/file/bot${cfg.botToken}/${f.file_path}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const content = await res.text();
+    mediaDeliver(
+      chatId,
+      ctx,
+      `[Content of ${name}]:\n${content}${caption ? `\n\nCaption: ${caption}` : ""}`,
+    );
+  } catch (err) {
+    console.error("[bridge] document fetch failed:", err);
+    mediaDeliver(chatId, ctx, `📎 [${name}] — failed to read content: ${String(err)}`);
+  }
+}
+
+bot.on("document", (ctx) => {
+  void handleDocument(ctx).catch((err) => console.error("[bridge] document handler error:", err));
+});
+bot.on("photo", (ctx) => {
+  const chatId = ctx.chat.id;
+  if (!allowed(ctx.from?.id)) return;
+  mediaDeliver(
+    chatId,
+    ctx,
+    `📷 [photo]${ctx.message.caption ? ` Caption: ${ctx.message.caption}` : ""}`,
+  );
+});
+bot.on("voice", (ctx) => {
+  const chatId = ctx.chat.id;
+  if (!allowed(ctx.from?.id)) return;
+  mediaDeliver(chatId, ctx, "🎤 [voice message]");
+});
+bot.on("video", (ctx) => {
+  const chatId = ctx.chat.id;
+  if (!allowed(ctx.from?.id)) return;
+  mediaDeliver(
+    chatId,
+    ctx,
+    `🎬 [video]${ctx.message.caption ? ` Caption: ${ctx.message.caption}` : ""}`,
+  );
+});
+bot.on("audio", (ctx) => {
+  const chatId = ctx.chat.id;
+  if (!allowed(ctx.from?.id)) return;
+  mediaDeliver(chatId, ctx, "🎵 [audio]");
+});
+bot.on("sticker", (ctx) => {
+  const chatId = ctx.chat.id;
+  if (!allowed(ctx.from?.id)) return;
+  mediaDeliver(chatId, ctx, "😀 [sticker]");
+});
+bot.on("location", (ctx) => {
+  const chatId = ctx.chat.id;
+  if (!allowed(ctx.from?.id)) return;
+  mediaDeliver(chatId, ctx, "📍 [location]");
+});
+
 async function route(ctx: any, text: string): Promise<void> {
   const chatId: number = ctx.chat.id;
   const trimmed = text.trim();
