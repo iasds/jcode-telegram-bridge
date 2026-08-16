@@ -63,14 +63,25 @@
 
 ## E. 建议执行清单(按优先级)
 
-| 优先级 | 项 | 说明 |
+**执行状态(2026-08-16,commit 714ad84 + 8a95028):**
+
+| 优先级 | 项 | 状态 |
 |---|---|---|
-| P0(高,小改) | B4 truncate 末块围栏平衡 + lstrip | 明确 bug,几分钟修复,加测试 |
-| P1(中,小改) | B1 429 翻倍退避(上限 10s) | 对齐 hermes 策略,增强 flood 耐受 |
-| P1(中,小改) | B5 stream.ts sendChunk link preview | 补齐配置一致性 |
-| P2(中) | B6 typing 指示 + `set_my_commands` 菜单注册 | 提升可发现性与反馈 |
-| P2(中) | C15 reactions + 通知模式(可选) | 低成本 UX 增强 |
-| P3(defer) | C2 文本文档注入、C7 /undo | 依赖 SDK/daemon 能力,待评估 |
+| P0 | B4 truncate 末块围栏平衡 + lstrip | ✅ 已实施(truncate.ts,含测试) |
+| P1 | B1 429 翻倍退避(上限 10s) | ✅ 已实施(stream.ts editIntervalMs) |
+| P1 | B5 stream.ts sendChunk link preview | ✅ 已实施(构造器 opts,已接线) |
+| P2 | B6 typing + set_my_commands + 状态指示 | ✅ 已实施(4s cadence / 16 命令菜单 / Online) |
+| P2 | C15 reactions + 通知模式 | ✅ 已实施(ENABLE_REACTIONS,👀/👍/👎;working/tool 静音) |
+| P2 | B3 工具行 emoji 映射 | ✅ 已实施(每工具 emoji,fallback ⚙️) |
+| P3 | C14 长文本批处理 | ✅ 已实施(batch.ts TextBatchAggregator,已接线) |
+| P3 | C5 管理命令 /restart /update /sethome /platform | ✅ 已实施 |
+| P3 | C7 会话命令 /undo /title /sessions /resume /retry | ✅ 已实施(SDK rewindUndo 等) |
+| P3 | C2a 文本文档注入 + 媒体占位 | ✅ 已实施(≤100KB 文本内联;照片/语音等占位) |
+| P3 | C2b 图片输入 | ⏸ 探针实测:daemon 接受但 opencode-go/deepseek-v4-flash 400(无视觉),defer |
+| P3 | C6 /background /steer | ✅ 已实施(/background 实测 3s 返回;/steer softInterrupt) |
+| — | C13 held-inbound | ⏸ 跳过:offset 持久化已防重放,断连窗口极小 |
+| — | C4 DM Topics / C8 webhook / C9 fallback IP / C11 draft-Rich / C2c STT | ⏸ 评估后跳过(依赖实验性 Bot API/外部服务/无需求) |
+
 
 不补项:审批流(C1)、管理命令(C5)、webhook(C8)、fallback IP(C9)、本地 Bot API server(C10)、DM Topics(C4)、draft/Rich(C11)、多平台(D2)——均为设计差异或超出单用户桥的合理范围。
 
