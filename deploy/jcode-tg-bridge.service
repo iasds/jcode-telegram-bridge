@@ -1,0 +1,14 @@
+[Unit]
+Description=jcode Telegram bridge (official TS SDK)
+After=jcode-api-bridge.service
+Wants=jcode-api-bridge.service
+
+[Service]
+StartLimitIntervalSec=120
+WorkingDirectory=/home/user/jcode-telegram-bridge
+ExecStart=/usr/bin/node dist/bridge.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+state.json
+
+# runtime state (never commit)
+poll-offset.txt

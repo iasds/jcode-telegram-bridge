@@ -1,0 +1,11 @@
+[Unit]
+Description=jcode Harness API bridge (SDK unix socket)
+
+[Service]
+StartLimitIntervalSec=120
+ExecStart=/home/user/bin/jcode api-bridge
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
