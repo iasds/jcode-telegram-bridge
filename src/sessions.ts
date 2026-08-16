@@ -15,6 +15,14 @@ interface Persisted {
   chats: Record<string, ChatState>;
 }
 
+/** Thrown when a chat's turn queue is full (QUEUE_LIMIT). */
+export class QueueFullError extends Error {
+  constructor(public readonly limit: number) {
+    super(`queue full (limit ${limit})`);
+    this.name = "QueueFullError";
+  }
+}
+
 /**
  * Maps Telegram chat_id -> jcode session, persists to state.json,
  * and provides a per-session FIFO queue so one session never runs
@@ -23,6 +31,8 @@ interface Persisted {
 export class SessionStore {
   private chats: Record<string, ChatState> = {};
   private queues = new Map<string, Promise<unknown>>();
+  /** Running + pending turn count per chat key. */
+  private depths = new Map<string, number>();
   private saveTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -73,18 +83,41 @@ export class SessionStore {
   }
 
   /** Serialize work on one session: returns a promise that resolves when it's this caller's turn. */
-  enqueue<T>(chatId: number, fn: () => Promise<T>): Promise<T> {
+  enqueue<T>(chatId: number, fn: () => Promise<T>, limit = Infinity): Promise<T> {
     const key = String(chatId);
+    const depth = (this.depths.get(key) ?? 0) + 1;
+    if (depth > limit) {
+      return Promise.reject(new QueueFullError(limit));
+    }
+    this.depths.set(key, depth);
     const prev = this.queues.get(key) ?? Promise.resolve();
     const run = prev.then(fn, fn); // run regardless of previous outcome
     this.queues.set(
       key,
       run.then(
-        () => undefined,
-        () => undefined,
+        () => this.decDepth(key),
+        () => this.decDepth(key),
       ),
     );
     return run;
+  }
+
+  /** Running + pending turns for a chat (0 when idle). */
+  queueDepth(chatId: number): number {
+    return this.depths.get(String(chatId)) ?? 0;
+  }
+
+  /** All non-idle chats with their queue depths. */
+  allQueueDepths(): Array<[number, number]> {
+    return [...this.depths.entries()]
+      .filter(([, d]) => d > 0)
+      .map(([k, d]) => [Number(k), d]);
+  }
+
+  private decDepth(key: string): void {
+    const next = (this.depths.get(key) ?? 1) - 1;
+    if (next <= 0) this.depths.delete(key);
+    else this.depths.set(key, next);
   }
 
   /** Reverse lookup: sessionId -> chatId (for event routing). */

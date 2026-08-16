@@ -135,10 +135,39 @@ export class StreamingRenderer {
     const chunks = truncateMessage(formatMessage(text));
     await this.edit(chunks[0], true);
     for (let i = 1; i < chunks.length; i++) {
+      await this.sendChunk(chunks[i]);
+    }
+  }
+
+  /**
+   * Send one reply chunk (chunks 2+) with 429 Retry-After backoff and a
+   * plain-text fallback when MarkdownV2 is rejected, matching the run()
+   * renderer's sendRetry policy so long replies never silently drop words.
+   */
+  private async sendChunk(text: string): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
       try {
-        await this.bot.telegram.sendMessage(this.chatId, chunks[i], { parse_mode: "MarkdownV2" });
+        await this.bot.telegram.sendMessage(this.chatId, text, { parse_mode: "MarkdownV2" });
+        return;
       } catch (err) {
+        if (String(err).includes("429") && attempt < 2) {
+          const wait = retryAfterMs(err) ?? 2000;
+          console.warn(`[stream] 429 flood, waiting ${wait}ms`);
+          await sleep(wait);
+          continue;
+        }
+        if (String(err).includes("400")) {
+          // MarkdownV2 rejected -> plain text
+          try {
+            await this.bot.telegram.sendMessage(this.chatId, stripMdv2(text));
+            return;
+          } catch (err2) {
+            console.error("[stream] plain chunk send failed:", err2);
+            return;
+          }
+        }
         console.error("[stream] chunk send failed:", err);
+        return;
       }
     }
   }

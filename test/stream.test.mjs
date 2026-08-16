@@ -106,3 +106,56 @@ test("tool start finalizes segment, sends tool line, starts fresh message", asyn
   assert.ok(sends[sends.length - 1].text.includes("▉"), "fresh stream message started");
   assert.equal(r.accumulated, "", "accumulator reset after tool boundary");
 });
+
+test("finish: chunk 2+ MarkdownV2 rejection falls back to plain text", async () => {
+  let markdownSends = 0;
+  const calls = [];
+  const bot = {
+    telegram: {
+      sendMessage: async (_chatId, text, extra) => {
+        if (extra?.parse_mode) {
+          markdownSends++;
+          if (markdownSends === 1) {
+            // First fresh chunk (chunks[1]) rejected -> plain fallback.
+            const e = new Error("400: Bad Request");
+            throw e;
+          }
+        }
+        calls.push({ text, parse: extra?.parse_mode });
+        return { message_id: 999 };
+      },
+      editMessageText: async () => true,
+    },
+  };
+  const r = new StreamingRenderer(bot, 1);
+  r.msgId = 100;
+  r.accumulated = "y".repeat(9000); // >4096 -> chunked
+  await r.finish();
+  assert.ok(calls.some((c) => c.parse === undefined), "expected a plain-text fallback send");
+});
+
+test("finish: chunk 429 retries after Retry-After backoff", async () => {
+  let attempts = 0;
+  const calls = [];
+  const bot = {
+    telegram: {
+      sendMessage: async (_chatId, text, extra) => {
+        attempts++;
+        if (attempts === 1) {
+          const e = new Error("429: Too Many Requests");
+          e.response = { parameters: { retry_after: 0 } };
+          throw e;
+        }
+        calls.push(text);
+        return { message_id: 999 };
+      },
+      editMessageText: async () => true,
+    },
+  };
+  const r = new StreamingRenderer(bot, 1);
+  r.msgId = 100;
+  r.accumulated = "z".repeat(9000);
+  await r.finish();
+  assert.equal(attempts, 3, "2 chunks + 1 retry");
+  assert.equal(calls.length, 2); // chunk1 retried + chunk2
+});

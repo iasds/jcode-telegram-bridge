@@ -1,5 +1,6 @@
 import type { JcodeClient } from "@1jehuang/jcode-sdk";
 import type { Context } from "telegraf";
+import { readFileSync } from "node:fs";
 import type { Config } from "./config.js";
 import { formatMessage, stripMdv2, escapeMdv2 } from "./markdown.js";
 import type { SessionStore } from "./sessions.js";
@@ -21,6 +22,14 @@ const HELP = `
 Any other text message is sent directly to the jcode agent.
 `.trim();
 
+/** Bridge-owned callbacks the command layer needs (kept in one object to avoid parameter sprawl). */
+export interface BridgeHooks {
+  openModelPicker?: (chatId: number, replyTo?: number) => Promise<void>;
+  cancelTurn?: (chatId: number) => void;
+  /** Number of in-flight streaming turns right now (0 when idle). */
+  activeTurns?: () => number;
+}
+
 /**
  * Handle slash commands. Returns true when the message was a handled command.
  */
@@ -31,8 +40,7 @@ export async function handleCommand(
   store: SessionStore,
   renderer: TurnRenderer,
   cfg: Config,
-  openModelPicker?: (chatId: number, replyTo?: number) => Promise<void>,
-  cancelTurn?: (chatId: number) => void,
+  hooks: BridgeHooks = {},
 ): Promise<boolean> {
   const chatId = ctx.chat?.id;
   if (chatId === undefined) return false;
@@ -60,8 +68,16 @@ export async function handleCommand(
       try {
         const sessions = await client.listSessions();
         await client.ping();
+        let offset: string | null = null;
+        try {
+          offset = readFileSync(cfg.offsetFile, "utf8").trim();
+        } catch {
+          /* offset file not written yet */
+        }
+        const depths = store.allQueueDepths().map(([c, d]) => `${c}:${d}`).join(", ") || "none";
+        const active = hooks.activeTurns ? hooks.activeTurns() : -1;
         await reply(
-          `*Status*\nBridge: running\ndaemon: online\nPersistent sessions: ${sessions.length}\nBound Telegram chats: ${store.all().length}`,
+          `*Status*\nBridge: running\ndaemon: online\nPersistent sessions: ${sessions.length}\nBound Telegram chats: ${store.all().length}\nPoll offset: ${offset ?? "n/a"}\nQueue depth: ${escapeMdv2(depths)}\nActive turns: ${active}`,
         );
       } catch (err) {
         await reply(`*Status*\ndaemon connection failed: ${escapeMdv2(String(err))}`);
@@ -118,8 +134,8 @@ export async function handleCommand(
         const catalog = await client.listModels(st.sessionId);
         const current = catalog.current ?? "?";
         if (!arg) {
-          if (openModelPicker) {
-            await openModelPicker(chatId, ctx.message?.message_id);
+          if (hooks.openModelPicker) {
+            await hooks.openModelPicker(chatId, ctx.message?.message_id);
             return true;
           }
           const list = (catalog.models ?? [])
@@ -171,7 +187,7 @@ export async function handleCommand(
       }
       // Also tear down the in-flight stream child so the events() loop
       // unwinds immediately instead of waiting for turn_done.
-      cancelTurn?.(chatId);
+      hooks.cancelTurn?.(chatId);
       await reply("⏹ Cancel request sent.");
       return true;
     }

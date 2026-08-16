@@ -10,6 +10,8 @@ export interface Config {
   /** Derived from stateFile's directory: persisted Telegram poll offset. */
   offsetFile: string;
   turnTimeoutMs: number;
+  /** Max turns queued per chat (running + pending). */
+  queueLimit: number;
   planPrompt: string;
   planModePrefix: string;
   disableLinkPreviews: boolean;
@@ -44,6 +46,7 @@ export function loadConfig(): Config {
     stateFile,
     offsetFile: join(dirname(stateFile), "poll-offset.txt"),
     turnTimeoutMs: Number(process.env.TURN_TIMEOUT_MS ?? 10 * 60 * 1000),
+    queueLimit: Number(process.env.QUEUE_LIMIT ?? 5),
     planPrompt:
       process.env.PLAN_PROMPT ??
       "[Plan mode] Only output an execution plan (step list, files involved, risks). Do not run any tools, do not modify any files. Wait for user confirmation before executing.",

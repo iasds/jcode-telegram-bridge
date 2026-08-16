@@ -12,7 +12,7 @@ Source: https://github.com/iasds/jcode-telegram-bridge
 ## Architecture
 
 ```
-Telegram user ⇄ Bot API (native fetch long-poll, 5s poll)
+Telegram user ⇄ Bot API (native fetch long-poll, 15s poll)
     ⇅
 bridge.ts: session mapping + command set + markdown rendering (hermes-agent port)
     ⇅ JcodeClient.connect() (unix socket)
