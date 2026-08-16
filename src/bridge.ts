@@ -2,8 +2,10 @@ import { JcodeClient, HarnessError } from "@1jehuang/jcode-sdk";
 import { Telegraf } from "telegraf";
 import https from "node:https";
 import { readFileSync, writeFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { loadConfig } from "./config.js";
 import { SessionStore, QueueFullError } from "./sessions.js";
+import { TextBatchAggregator } from "./batch.js";
 import { TurnRenderer } from "./events.js";
 import { handleCommand, BridgeHooks } from "./commands.js";
 import { sendModelPicker, handleModelPickerCallback } from "./model-picker.js";
@@ -97,10 +99,54 @@ function cancelTurn(chatId: number): void {
   void t.child.close().catch(() => undefined);
 }
 
+// Last non-command text per chat (for /retry).
+const lastUserTexts = new Map<number, string>();
+// Cached ctx per chat (for batched flush + /retry re-route).
+const lastCtx = new Map<number, any>();
+// Quiet-period text aggregation for >4096 message splits (C14).
+const textBatcher = new TextBatchAggregator(
+  (chatId, text) => {
+    const ctx = lastCtx.get(chatId);
+    if (ctx) void route(ctx, text);
+  },
+  { maxWaitMs: 500 },
+);
+// Persisted home channel (alongside state.json).
+const HOME_FILE = join(dirname(cfg.stateFile), "home.json");
+let homeChatId: number | undefined;
+function loadHome(): number | undefined {
+  try {
+    const n = Number(JSON.parse(readFileSync(HOME_FILE, "utf8")).chatId);
+    return Number.isFinite(n) ? n : undefined;
+  } catch {
+    return undefined;
+  }
+}
+function saveHome(chatId: number): void {
+  try {
+    writeFileSync(HOME_FILE, JSON.stringify({ chatId }), { mode: 0o600 });
+  } catch (err) {
+    console.error("[bridge] save home failed:", err);
+  }
+}
+homeChatId = loadHome();
+
 const hooks: BridgeHooks = {
   openModelPicker,
   cancelTurn,
   activeTurns: () => activeTurns.size,
+  lastUserText: (chatId) => lastUserTexts.get(chatId),
+  retryLast: (chatId) => {
+    const last = lastUserTexts.get(chatId);
+    if (last) void route({ chat: { id: chatId }, message: { message_id: undefined } } as never, last);
+  },
+  homeChat: {
+    set: (chatId) => {
+      homeChatId = chatId;
+      saveHome(chatId);
+    },
+    get: () => homeChatId,
+  },
 };
 
 // Custom agent: socket idle timeout 60s so a stuck long-poll (proxy hangs the
@@ -154,12 +200,22 @@ bot.on("text", async (ctx) => {
   const fromId = ctx.from?.id;
   if (!chat || !fromId) return;
   renderer.cacheContext(chat.id, ctx);
+  lastCtx.set(chat.id, ctx);
   if (!allowed(fromId)) {
     console.log(`[bridge] ignored message from non-allowed user ${fromId}`);
     return;
   }
+  // Long-message chunk aggregation (C14): commands go straight to route(),
+  // plain text is quiet-period batched so >4096 splits arrive as one turn.
+  const deliver = (text: string) => {
+    if (text.trim().startsWith("/")) {
+      void route(ctx, text);
+    } else {
+      textBatcher.push(chat.id, text);
+    }
+  };
   if (chat.type === "private") {
-    await route(ctx, ctx.message.text);
+    deliver(ctx.message.text);
   } else if (chat.type === "group" || chat.type === "supergroup") {
     // Group chats: only respond when the bot is mentioned. Cache the
     // bot username so we don't hit getMe on every group message.
@@ -168,7 +224,7 @@ bot.on("text", async (ctx) => {
     }
     const text = stripMention(ctx.message.text, botUsername);
     if (text && text !== ctx.message.text) {
-      await route(ctx, text);
+      deliver(text);
     }
   }
 });
@@ -195,6 +251,8 @@ async function route(ctx: any, text: string): Promise<void> {
   // messages can never attach the same session concurrently (a rotation on
   // one could race the other's attach and double-create). Turns are
   // fire-and-forget so telegraf keeps processing updates (e.g. /cancel).
+  lastUserTexts.set(chatId, trimmed);
+  const userMsgId = ctx.message?.message_id;
   void store.enqueue(
     chatId,
       async () => {
@@ -240,6 +298,16 @@ async function route(ctx: any, text: string): Promise<void> {
       console.log("[stream] connected");
       const ac = new AbortController();
       activeTurns.set(chatId, { ac, child });
+      // Visual feedback: typing indicator every 4s + optional 👀 reaction.
+      const typingTimer = setInterval(() => {
+        void bot.telegram.sendChatAction(chatId, "typing").catch(() => undefined);
+      }, 4000);
+      let turnFailed = false;
+      if (cfg.enableReactions && userMsgId !== undefined) {
+        void bot.telegram
+          .setMessageReaction(chatId, userMsgId, [{ type: "emoji", emoji: "👀" }])
+          .catch(() => undefined);
+      }
       let stream: StreamingRenderer | null = null;
       let working: number | undefined;
       let turnStarted = false;
@@ -261,7 +329,9 @@ async function route(ctx: any, text: string): Promise<void> {
         await child.attachSession(st.sessionId);
         lastAttachSession = st.sessionId;
         console.log("[stream] attached");
-        stream = new StreamingRenderer(bot, chatId, replyTo);
+        stream = new StreamingRenderer(bot, chatId, replyTo, undefined, {
+          disableLinkPreviews: cfg.disableLinkPreviews,
+        });
         working = await stream.start();
         if (working === undefined) stream = null; // initial send failed -> fallback
         try {
@@ -306,6 +376,7 @@ async function route(ctx: any, text: string): Promise<void> {
           await renderer.finishWith(chatId, working, accumulated);
         }
       } catch (err) {
+        turnFailed = true;
         if (ac.signal.aborted) {
           // /cancel: the child was closed on purpose; finalize partial text
           // and report, don't surface an error.
@@ -338,6 +409,12 @@ async function route(ctx: any, text: string): Promise<void> {
         }
     } finally {
       clearTimeout(watchdog);
+      clearInterval(typingTimer);
+      if (cfg.enableReactions && userMsgId !== undefined) {
+        void bot.telegram
+          .setMessageReaction(chatId, userMsgId, [{ type: "emoji", emoji: turnFailed ? "👎" : "👍" }])
+          .catch(() => undefined);
+      }
       activeTurns.delete(chatId);
       await child.close().catch(() => undefined);
     }
@@ -447,6 +524,31 @@ async function pollLoop(bot: Telegraf): Promise<void> {
     }
   }
   console.log("[bridge] telegram polling started (native fetch loop)");
+  // Command menu + online indicator (hermes set_my_commands / status_indicator parity).
+  const COMMAND_MENU = [
+    { command: "start", description: "Welcome and status" },
+    { command: "help", description: "This help" },
+    { command: "status", description: "Bridge and daemon status" },
+    { command: "info", description: "Session runtime info" },
+    { command: "clear", description: "Clear session history" },
+    { command: "plan", description: "Toggle plan mode" },
+    { command: "model", description: "View or switch model" },
+    { command: "compact", description: "Compress context" },
+    { command: "cancel", description: "Cancel current turn" },
+    { command: "undo", description: "Undo last turn" },
+    { command: "title", description: "Set session title" },
+    { command: "sessions", description: "List sessions" },
+    { command: "retry", description: "Retry last message" },
+    { command: "sethome", description: "Set home channel" },
+    { command: "restart", description: "Restart bridge" },
+    { command: "update", description: "Update bridge" },
+  ];
+  void bot.telegram
+    .setMyCommands(COMMAND_MENU)
+    .catch((e) => console.error("[bridge] setMyCommands failed:", e));
+  void bot.telegram
+    .setMyShortDescription("Jcode bridge: online")
+    .catch(() => undefined);
   let offset = loadOffset();
   let consecutiveErrors = 0;
   while (true) {

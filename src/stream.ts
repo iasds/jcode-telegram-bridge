@@ -21,9 +21,46 @@ import { truncateMessage } from "./truncate.js";
  */
 
 const EDIT_INTERVAL_MS = 800;
+const MAX_EDIT_INTERVAL_MS = 10000;
 const BUFFER_THRESHOLD = 24;
 const CURSOR = " ▉";
 const MAX_FLOOD_STRIKES = 3;
+
+/** Tool name -> emoji for the onToolStart tool line (hermes-style). */
+const TOOL_EMOJIS: Record<string, string> = {
+  bash: "💻",
+  shell: "💻",
+  python: "🐍",
+  node: "🟩",
+  read: "📄",
+  write: "📄",
+  grep: "🔍",
+  search: "🔍",
+  web: "🌐",
+  http: "🌐",
+  git: "🔀",
+};
+const DEFAULT_TOOL_EMOJI = "⚙️";
+
+/**
+ * Map a tool name to an emoji: exact (case-insensitive) match first, then the
+ * leftmost known key inside the name (so "web_search" -> 🌐 and
+ * "http_request" -> 🌐), falling back to ⚙️ for anything unknown.
+ */
+function toolEmoji(name: string): string {
+  const n = name.trim().toLowerCase();
+  if (TOOL_EMOJIS[n]) return TOOL_EMOJIS[n];
+  let bestIdx = Infinity;
+  let bestKey = "";
+  for (const key of Object.keys(TOOL_EMOJIS)) {
+    const idx = n.indexOf(key);
+    if (idx !== -1 && idx < bestIdx) {
+      bestIdx = idx;
+      bestKey = key;
+    }
+  }
+  return bestKey ? TOOL_EMOJIS[bestKey] : DEFAULT_TOOL_EMOJI;
+}
 
 function retryAfterMs(err: unknown): number | undefined {
   const e = err as { response?: { parameters?: { retry_after?: number } } };
@@ -40,12 +77,14 @@ export class StreamingRenderer {
   private lastEditAt = 0;
   private floodStrikes = 0;
   private cancelled = false;
+  private editIntervalMs = EDIT_INTERVAL_MS;
 
   constructor(
     private bot: Telegraf,
     private chatId: number,
     private replyTo?: number,
     private now: () => number = Date.now,
+    private opts?: { disableLinkPreviews?: boolean },
   ) {}
 
   /** Send the initial streamed message (just the cursor); returns its id. */
@@ -74,12 +113,13 @@ export class StreamingRenderer {
         const msg = String(err);
         if (msg.includes("429") && attempt < 2) {
           this.floodStrikes++;
+          this.editIntervalMs = Math.min(this.editIntervalMs * 2, MAX_EDIT_INTERVAL_MS);
           if (this.floodStrikes >= MAX_FLOOD_STRIKES) {
             this.failed = true;
             return false;
           }
           const wait = retryAfterMs(err) ?? 2000;
-          console.warn(`[stream] 429 flood, waiting ${wait}ms`);
+          console.warn(`[stream] 429 flood, waiting ${wait}ms (edit interval ${this.editIntervalMs}ms)`);
           await sleep(wait);
           continue;
         }
@@ -105,7 +145,7 @@ export class StreamingRenderer {
     const now = this.now();
     const elapsed = now - this.lastEditAt;
     const cpLen = [...this.accumulated].length;
-    if ((elapsed >= EDIT_INTERVAL_MS && this.accumulated.length > 0) || cpLen >= BUFFER_THRESHOLD) {
+    if ((elapsed >= this.editIntervalMs && this.accumulated.length > 0) || cpLen >= BUFFER_THRESHOLD) {
       this.lastEditAt = now;
       await this.edit(this.accumulated + CURSOR);
     }
@@ -118,7 +158,7 @@ export class StreamingRenderer {
       await this.edit(formatMessage(this.accumulated), true);
     }
     try {
-      await this.bot.telegram.sendMessage(this.chatId, `🔧 [${formatMessage(name)}]`);
+      await this.bot.telegram.sendMessage(this.chatId, `${toolEmoji(name)} [${formatMessage(name)}]`);
     } catch (err) {
       console.error("[stream] tool line failed:", err);
     }
@@ -145,9 +185,15 @@ export class StreamingRenderer {
    * renderer's sendRetry policy so long replies never silently drop words.
    */
   private async sendChunk(text: string): Promise<void> {
+    const preview = this.opts?.disableLinkPreviews
+      ? { link_preview_options: { is_disabled: true } }
+      : undefined;
     for (let attempt = 0; ; attempt++) {
       try {
-        await this.bot.telegram.sendMessage(this.chatId, text, { parse_mode: "MarkdownV2" });
+        await this.bot.telegram.sendMessage(this.chatId, text, {
+          parse_mode: "MarkdownV2",
+          ...preview,
+        });
         return;
       } catch (err) {
         if (String(err).includes("429") && attempt < 2) {
@@ -159,7 +205,7 @@ export class StreamingRenderer {
         if (String(err).includes("400")) {
           // MarkdownV2 rejected -> plain text
           try {
-            await this.bot.telegram.sendMessage(this.chatId, stripMdv2(text));
+            await this.bot.telegram.sendMessage(this.chatId, stripMdv2(text), preview);
             return;
           } catch (err2) {
             console.error("[stream] plain chunk send failed:", err2);

@@ -63,3 +63,43 @@ test("UTF-16 surrogate pairs (emoji/Chinese) stay intact at boundary", () => {
     assert.ok(clean.length % 2 === 0, "surrogate pairs intact");
   }
 });
+
+test("final chunk inside an unclosed fence gets FENCE_CLOSE appended", () => {
+  const line = "x".repeat(500);
+  const body = `intro\n\`\`\`python\n${line}\n${line}\n${line}\n${line}\n${line}\n${line}\n${line}\n${line}\n${line}\n${line}\nmore code`;
+  // No closing fence anywhere: the whole tail stays inside the block.
+  assert.ok(body.length > MAX_MESSAGE_LENGTH);
+  assert.ok(!body.includes("\n```\n"), "fixture has no closing fence");
+  const chunks = truncateMessage(body);
+  assert.ok(chunks.length > 1);
+  const last = chunks[chunks.length - 1].replace(/\s*\(\d+\/\d+\)$/, "");
+  assert.ok(last.endsWith("```"), `last chunk should end with closing fence: ${JSON.stringify(last.slice(-30))}`);
+  assert.equal((last.match(/```/g) ?? []).length % 2, 0, "final chunk fences must be balanced");
+});
+
+test("already-closed fence in final chunk is not double-closed", () => {
+  const line = "x".repeat(500);
+  // The closing fence is the very last line of the content, so it lands in
+  // the final chunk; the walk sees it and must not append FENCE_CLOSE again.
+  const body = `intro\n\`\`\`python\n${line}\n${line}\n${line}\n${line}\n${line}\n${line}\n${line}\n${line}\n${line}\n${line}\n\`\`\``;
+  assert.ok(body.length > MAX_MESSAGE_LENGTH);
+  const chunks = truncateMessage(body);
+  assert.ok(chunks.length > 1);
+  for (const c of chunks) {
+    const clean = c.replace(/\s*\(\d+\/\d+\)$/, "");
+    assert.equal((clean.match(/```/g) ?? []).length % 2, 0, `unbalanced fences: ${clean.slice(0, 60)}`);
+  }
+  const last = chunks[chunks.length - 1].replace(/\s*\(\d+\/\d+\)$/, "");
+  assert.ok(last.endsWith("```"), "final chunk should still carry its closing fence");
+  assert.ok(!last.endsWith("\n```\n```"), `double-closed fence: ${JSON.stringify(last.slice(-30))}`);
+});
+
+test("leading whitespace at a split boundary is stripped (lstrip)", () => {
+  const text = "x".repeat(4000) + "\n  继续" + "y".repeat(1000);
+  assert.ok(text.length > MAX_MESSAGE_LENGTH);
+  const chunks = truncateMessage(text);
+  assert.ok(chunks.length > 1, "should split");
+  const second = chunks[1].replace(/\s*\(\d+\/\d+\)$/, "");
+  assert.ok(!/^\s/.test(second), `second chunk starts with whitespace: ${JSON.stringify(second.slice(0, 12))}`);
+  assert.ok(second.startsWith("继续"), "content after stripped whitespace is preserved");
+});

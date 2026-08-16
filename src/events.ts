@@ -48,6 +48,7 @@ export class TurnRenderer {
     try {
       const msg = await ctx.telegram.sendMessage(chatId, "⏳ Working…", {
         reply_parameters: replyTo ? { message_id: replyTo } : undefined,
+        disable_notification: true,
       });
       return msg.message_id;
     } catch (err) {
@@ -61,7 +62,9 @@ export class TurnRenderer {
     const ctx = this.ctxCache.get(chatId);
     if (!ctx) return;
     try {
-      await ctx.telegram.sendMessage(chatId, `🔧 [${formatMessage(name)}]`);
+      await ctx.telegram.sendMessage(chatId, `🔧 [${formatMessage(name)}]`, {
+        disable_notification: true,
+      });
     } catch (err) {
       console.error("[renderer] tool line failed:", err);
     }

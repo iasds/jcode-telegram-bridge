@@ -11,13 +11,22 @@ const HELP = `
 
 /start Welcome and status
 /help This help
-/status Bridge and daemon status (bridge-only, not a TUI command)
+/status Bridge and daemon status (bridge-only)
 /info Current session runtime info (provider / model)
 /clear Clear the current session history
 /plan Toggle plan mode (plan only, no execution)
 /model [name] View or switch model
 /compact Request long-context compression
 /cancel Interrupt the current turn
+/undo Undo the last turn
+/title <name> Title this chat's session
+/sessions List daemon sessions
+/resume <id> Attach a different session
+/retry Re-run your last message
+/sethome Set this chat as home channel
+/platform Platform connection status
+/restart Restart the bridge process
+/update git pull + rebuild + restart
 
 Any other text message is sent directly to the jcode agent.
 `.trim();
@@ -28,6 +37,15 @@ export interface BridgeHooks {
   cancelTurn?: (chatId: number) => void;
   /** Number of in-flight streaming turns right now (0 when idle). */
   activeTurns?: () => number;
+  /** Last non-command text this chat sent (for /retry). */
+  lastUserText?: (chatId: number) => string | undefined;
+  /** Re-route the last user message for this chat (for /retry). */
+  retryLast?: (chatId: number) => void;
+  /** Persisted home channel for this chat (for /sethome). */
+  homeChat?: {
+    set: (chatId: number) => void;
+    get: () => number | undefined;
+  };
 }
 
 /**
@@ -189,6 +207,125 @@ export async function handleCommand(
       // unwinds immediately instead of waiting for turn_done.
       hooks.cancelTurn?.(chatId);
       await reply("⏹ Cancel request sent.");
+      return true;
+    }
+
+    case "undo": {
+      const st = store.get(chatId);
+      if (!st) {
+        await reply("No session to undo yet. Send a message first.");
+        return true;
+      }
+      try {
+        await client.attachSession(st.sessionId);
+        await client.rewindUndo(st.sessionId);
+        await reply("⏪ Undone — rewound to the previous state.");
+      } catch (err) {
+        await reply(`Undo failed: ${escapeMdv2(String(err))}`);
+      }
+      return true;
+    }
+
+    case "title": {
+      const st = await store.getOrCreate(chatId);
+      try {
+        await client.attachSession(st.sessionId);
+        if (!arg) {
+          await reply("Usage: /title <name> — set this chat's session title.");
+          return true;
+        }
+        await client.renameSession(st.sessionId, arg);
+        await reply(`✅ Session titled \`${escapeMdv2(arg)}\`.`);
+      } catch (err) {
+        await reply(`Title failed: ${escapeMdv2(String(err))}`);
+      }
+      return true;
+    }
+
+    case "sessions": {
+      try {
+        const sessions = await client.listSessions();
+        const lines = sessions
+          .slice(0, 20)
+          .map((s) => {
+            const id = String((s as { session_id?: unknown }).session_id ?? s);
+            return `\`${escapeMdv2(id.slice(0, 28))}\``;
+          })
+          .join("\n");
+        await reply(`*Sessions* (${sessions.length})\n${lines || "(none)"}\n\nUsage: /resume <session-id>`);
+      } catch (err) {
+        await reply(`List failed: ${escapeMdv2(String(err))}`);
+      }
+      return true;
+    }
+
+    case "resume": {
+      if (!arg) {
+        await reply("Usage: /resume <session-id> (see /sessions).");
+        return true;
+      }
+      const st = await store.getOrCreate(chatId);
+      store.set(chatId, { ...st, sessionId: arg });
+      await reply(`✅ Switched this chat to session \`${escapeMdv2(arg)}\`.`);
+      return true;
+    }
+
+    case "retry": {
+      const last = hooks.lastUserText?.(chatId);
+      if (!last) {
+        await reply("No previous message to retry.");
+        return true;
+      }
+      hooks.retryLast?.(chatId);
+      await reply("🔁 Retrying your last message…");
+      return true;
+    }
+
+    case "sethome": {
+      hooks.homeChat?.set(chatId);
+      await reply("🏠 Home channel set to this chat.");
+      return true;
+    }
+
+    case "platform": {
+      let offset: string | null = null;
+      try {
+        offset = readFileSync(cfg.offsetFile, "utf8").trim();
+      } catch {
+        /* not written yet */
+      }
+      await reply(
+        `*Platform*\nTelegram: connected (long-poll, timeout 15s)\nPoll offset: ${offset ?? "n/a"}\nActive turns: ${hooks.activeTurns ? hooks.activeTurns() : -1}`,
+      );
+      return true;
+    }
+
+    case "restart": {
+      await reply("🔄 Restarting bridge…");
+      setTimeout(() => process.exit(0), 800); // systemd Restart=always brings it back
+      return true;
+    }
+
+    case "update": {
+      await reply("📦 Updating (git pull + rebuild)…");
+      const { execFile } = await import("node:child_process");
+      execFile(
+        "bash",
+        ["-lc", `cd "${process.cwd()}" && git pull --ff-only && npm ci --silent && npm run build`],
+        { timeout: 180_000 },
+        (err, stdout, stderr) => {
+          if (err) {
+            void renderer
+              .safeSendMessage(chatId, `⚠️ Update failed: ${escapeMdv2(String(err))}\n${escapeMdv2(String(stderr).slice(-500))}`)
+              .catch(() => undefined);
+            return;
+          }
+          void renderer
+            .safeSendMessage(chatId, `✅ Updated (${String(stdout).slice(-200)})\nRestarting…`)
+            .then(() => setTimeout(() => process.exit(0), 800))
+            .catch(() => process.exit(0));
+        },
+      );
       return true;
     }
 

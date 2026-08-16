@@ -41,7 +41,26 @@ export function truncateMessage(content: string, maxLength = MAX_MESSAGE_LENGTH)
 
     // Everything remaining fits in one final chunk.
     if (prefix.length + remaining.length <= maxLength - INDICATOR_RESERVE) {
-      chunks.push(prefix + remaining);
+      let finalChunk = prefix + remaining;
+      // If the previous chunk ended inside a fenced code block (carryLang
+      // set), this chunk starts with a reopening fence. Walk the remaining
+      // text to see whether the block was closed; if it is still open,
+      // append FENCE_CLOSE so the final chunk stands alone. When the text
+      // already ends with a closing fence (its last line is "```"), the
+      // walk ends with the block closed and nothing extra is appended.
+      if (carryLang !== null) {
+        let finalInCode = true;
+        for (const line of remaining.split("\n")) {
+          const stripped = line.trim();
+          if (stripped.startsWith("```")) {
+            finalInCode = !finalInCode;
+          }
+        }
+        if (finalInCode) {
+          finalChunk += FENCE_CLOSE;
+        }
+      }
+      chunks.push(finalChunk);
       break;
     }
 
@@ -97,7 +116,9 @@ export function truncateMessage(content: string, maxLength = MAX_MESSAGE_LENGTH)
     }
 
     chunks.push(fullChunk);
-    remaining = remaining.slice(splitAt);
+    // Strip leading whitespace left at the split boundary so the next chunk
+    // does not start with it (hermes: remaining[split_at:].lstrip()).
+    remaining = remaining.slice(splitAt).replace(/^[ \t\n\r\f\v]+/, "");
   }
 
   if (chunks.length > 1) {
