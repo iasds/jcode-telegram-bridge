@@ -32,6 +32,7 @@ export async function handleCommand(
   renderer: TurnRenderer,
   cfg: Config,
   openModelPicker?: (chatId: number, replyTo?: number) => Promise<void>,
+  cancelTurn?: (chatId: number) => void,
 ): Promise<boolean> {
   const chatId = ctx.chat?.id;
   if (chatId === undefined) return false;
@@ -164,10 +165,14 @@ export async function handleCommand(
       try {
         await client.attachSession(st.sessionId);
         await client.cancel(st.sessionId);
-        await reply("⏹ Cancel request sent.");
       } catch (err) {
         await reply(`Cancel failed: ${escapeMdv2(String(err))}`);
+        return true;
       }
+      // Also tear down the in-flight stream child so the events() loop
+      // unwinds immediately instead of waiting for turn_done.
+      cancelTurn?.(chatId);
+      await reply("⏹ Cancel request sent.");
       return true;
     }
 

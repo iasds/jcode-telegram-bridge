@@ -1,5 +1,7 @@
 # jcode Telegram Bridge
 
+![CI](https://github.com/iasds/jcode-telegram-bridge/actions/workflows/ci.yml/badge.svg)
+
 A Telegram ↔ jcode bridge built on the official
 [@1jehuang/jcode-sdk](https://jcode.sh/sdk). Messages from Telegram are
 injected into a local jcode daemon session and replies stream back to

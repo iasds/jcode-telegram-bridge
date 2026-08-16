@@ -2,14 +2,18 @@ import { JcodeClient, HarnessError } from "@1jehuang/jcode-sdk";
 import { Telegraf } from "telegraf";
 import https from "node:https";
 import { readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { SessionStore } from "./sessions.js";
 import { TurnRenderer } from "./events.js";
 import { handleCommand } from "./commands.js";
 import { sendModelPicker, handleModelPickerCallback } from "./model-picker.js";
 import { StreamingRenderer } from "./stream.js";
+import {
+  advanceOffset,
+  parseOffset,
+  isFatalHarnessError,
+  canFallbackToRun,
+} from "./logic.js";
 
 const cfg = loadConfig();
 
@@ -46,7 +50,6 @@ const openModelPicker = async (chatId: number, replyTo?: number): Promise<void> 
 // restarted, socket closed), exit so systemd Restart=always brings us back
 // with a fresh connection. Without this the bridge idles forever on a dead
 // socket and every turn fails silently.
-const FATAL_CODES = new Set(["disconnected", "connect_failed"]);
 function fatalExit(reason: string): never {
   console.error(`[bridge] fatal connection error (${reason}); exiting for systemd restart`);
   process.exit(1);
@@ -83,6 +86,17 @@ client.on("close", () => {
   fatalExit("harness connection closed");
 });
 
+// In-flight turns per chat: /cancel aborts the controller and closes the
+// child connection so the events() loop unwinds promptly instead of waiting
+// for turn_done or the ~10.5min request timeout.
+const activeTurns = new Map<number, { ac: AbortController; child: JcodeClient }>();
+function cancelTurn(chatId: number): void {
+  const t = activeTurns.get(chatId);
+  if (!t) return;
+  t.ac.abort();
+  void t.child.close().catch(() => undefined);
+}
+
 // Custom agent: socket idle timeout 60s so a stuck long-poll (proxy hangs the
 // connection without responding) errors out instead of hanging forever.
 // telegraf's own request timeout is hardcoded to 500s, which would leave the
@@ -114,13 +128,13 @@ bot.use(async (_ctx, next) => next());
 bot.start(async (ctx) => {
   if (!allowed(ctx.from?.id)) return;
   renderer.cacheContext(ctx.chat.id, ctx);
-  await handleCommand(ctx, "/start", client, store, renderer, cfg, openModelPicker);
+  await handleCommand(ctx, "/start", client, store, renderer, cfg, openModelPicker, cancelTurn);
 });
 
 bot.help(async (ctx) => {
   if (!allowed(ctx.from?.id)) return;
   renderer.cacheContext(ctx.chat.id, ctx);
-  await handleCommand(ctx, "/help", client, store, renderer, cfg, openModelPicker);
+  await handleCommand(ctx, "/help", client, store, renderer, cfg, openModelPicker, cancelTurn);
 });
 
 bot.on("callback_query", (ctx) => {
@@ -159,7 +173,9 @@ async function route(ctx: any, text: string): Promise<void> {
 
   // Commands first.
   if (trimmed.startsWith("/")) {
-    const handled = await handleCommand(ctx, trimmed, client, store, renderer, cfg, openModelPicker);
+    const handled = await handleCommand(
+      ctx, trimmed, client, store, renderer, cfg, openModelPicker, cancelTurn,
+    );
     if (handled) return;
     // Unknown command: do NOT fall through to a normal turn (that would send
     // e.g. /new to the agent as plain text). Reply and stop.
@@ -171,24 +187,33 @@ async function route(ctx: any, text: string): Promise<void> {
     return;
   }
 
-  // Normal turn: queue per session so one session never runs two turns.
-  try {
+  // Normal turn: getOrCreate + attach happen INSIDE the queue so two rapid
+  // messages can never attach the same session concurrently (a rotation on
+  // one could race the other's attach and double-create). Turns are
+  // fire-and-forget so telegraf keeps processing updates (e.g. /cancel).
+  void store.enqueue(chatId, async () => {
+    // -- session lookup + attach (serialized per chat) -------------------
     let st = await store.getOrCreate(chatId);
     try {
       await client.attachSession(st.sessionId);
       lastAttachSession = st.sessionId;
     } catch (err) {
       // Session is missing on the daemon (cleared/pruned/daemon restart) or
-      // poisoned (attach makes the daemon reset the socket). Either way drop
-      // the stale mapping and recreate so the chat recovers automatically
-      // instead of erroring forever. A truly dead connection raises
-      // FATAL_CODES and is allowed to propagate to the process-level exit.
-      if (err instanceof HarnessError && FATAL_CODES.has(err.code)) throw err;
+      // poisoned (attach makes the daemon reset the socket). Drop the stale
+      // mapping and recreate so the chat recovers automatically. A truly
+      // dead connection raises FATAL_CODES and propagates to the queue
+      // catch below (process-level exit).
+      if (isFatalHarnessError(err)) throw err;
       console.warn(
         `[route] attach ${st.sessionId.slice(0, 16)}… failed (${err instanceof Error ? err.message : String(err)}); recreating`,
       );
+      const mode = st.mode; // preserve plan mode across rotation
       store.remove(chatId);
       st = await store.getOrCreate(chatId);
+      if (st.mode !== mode) {
+        st = { ...st, mode };
+        store.set(chatId, st);
+      }
       await client.attachSession(st.sessionId);
       lastAttachSession = st.sessionId;
     }
@@ -196,98 +221,127 @@ async function route(ctx: any, text: string): Promise<void> {
       st.mode === "plan" ? `${cfg.planModePrefix}\n${trimmed}` : trimmed;
     const replyTo = ctx.message?.message_id;
 
-    // Fire-and-forget: the turn runs in the background so telegraf can keep
-    // processing updates (e.g. /cancel) while the model is still working.
-    void store.enqueue(chatId, async () => {
-      // Streaming path: a per-turn child connection (same pattern the SDK's
-      // globalEvents uses internally) consumes events() reliably, letting the
-      // reply stream into Telegram via progressive edits. Falls back to
-      // run() only if the turn never started (attach/send failed); if
-      // streaming itself fails mid-turn (flood strikes), collect the text
-      // and deliver once.
-      console.log("[stream] connect");
-      const child = await JcodeClient.connect({
-        clientName: "jcode-tg-bridge-stream/1.0",
-        requestTimeoutMs: cfg.turnTimeoutMs + 30_000,
-      });
-      console.log("[stream] connected");
-      let stream: StreamingRenderer | null = null;
-      let working: number | undefined;
-      let turnStarted = false;
-      let accumulated = "";
+    // -- streaming path ------------------------------------------------
+    // A per-turn child connection (same pattern the SDK's globalEvents uses
+    // internally) consumes events() reliably, letting the reply stream into
+    // Telegram via progressive edits. Falls back to run() only if the turn
+    // never started; a half-sent message is never re-run (double-execution).
+    console.log("[stream] connect");
+    const child = await JcodeClient.connect({
+      clientName: "jcode-tg-bridge-stream/1.0",
+      requestTimeoutMs: cfg.turnTimeoutMs + 30_000,
+    });
+    console.log("[stream] connected");
+    const ac = new AbortController();
+    activeTurns.set(chatId, { ac, child });
+    let stream: StreamingRenderer | null = null;
+    let working: number | undefined;
+    let turnStarted = false;
+    let accumulated = "";
+    let timedOut = false;
+    // Watchdog: if the daemon never emits turn_done/error, tell the user and
+    // tear down the child instead of hanging silently until the request
+    // timeout.
+    const watchdog = setTimeout(() => {
+      timedOut = true;
+      void renderer
+        .safeSendMessage(chatId, "⏱ Turn timed out, interrupted. Try again or /clear.", replyTo)
+        .catch(() => undefined);
+      void child.close().catch(() => undefined);
+    }, cfg.turnTimeoutMs);
+    try {
+      console.log("[stream] attach", st.sessionId.slice(0, 20));
+      await child.attachSession(st.sessionId);
+      lastAttachSession = st.sessionId;
+      console.log("[stream] attached");
+      stream = new StreamingRenderer(bot, chatId, replyTo);
+      working = await stream.start();
+      if (working === undefined) stream = null; // initial send failed -> fallback
       try {
-        console.log("[stream] attach", st.sessionId.slice(0, 20));
-        await child.attachSession(st.sessionId);
-        lastAttachSession = st.sessionId;
-        console.log("[stream] attached");
-        stream = new StreamingRenderer(bot, chatId, replyTo);
-        working = await stream.start();
-        if (working === undefined) stream = null; // initial send failed -> fallback
-        try {
-          await child.sendMessage(st.sessionId, content, { waitForAccept: false });
-        } catch (sendErr) {
-          // The frame may already have reached the daemon (half-failure).
-          // Never run() again on this content — that would execute the turn
-          // twice and double-reply.
-          console.error("[route] sendMessage failed (turn may have started):", sendErr);
-        }
-        turnStarted = true;
-        console.log("[stream] consuming events");
-        let evCount = 0;
-        for await (const ev of child.events(st.sessionId)) {
-          evCount++;
-          if (ev.ev === "turn_done") { console.log("[stream] turn_done, events:", evCount); break; }
-          if (ev.ev === "text_delta") {
-            accumulated += ev.text;
-            if (stream && !stream.failed) await stream.onDelta(ev.text);
-          } else if (ev.ev === "tool_start") {
-            const name = (ev as { name?: string }).name ?? "tool";
-            if (stream && !stream.failed) await stream.onToolStart(name);
-          }
-        }
-        console.log("[stream] loop end, events:", evCount, "failed:", stream?.failed);
-        if (stream && !stream.failed) {
-          await stream.finish();
-          console.log("[stream] finished");
-        } else {
-          // streaming disabled/never started: deliver collected text once
-          if (stream) stream.cancel();
-          await renderer.finishWith(chatId, working, accumulated);
-        }
-      } catch (err) {
-        if (err instanceof HarnessError && FATAL_CODES.has(err.code)) {
-          fatalExit(`stream failed [${err.code}]: ${err.message}`);
-        }
-        console.error("[route] stream error:", err);
-        if (stream) await stream.cancel();
-        if (!turnStarted) {
-          // Safe to run() once: the turn never began on the daemon.
-          try {
-            const result = await client.run(st.sessionId, content, { autoApprove: true });
-            const w = working ?? (await renderer.sendWorking(chatId, replyTo));
-            await renderer.finishWith(chatId, w, result.text ?? "");
-          } catch (err2) {
-            if (err2 instanceof HarnessError && FATAL_CODES.has(err2.code)) {
-              fatalExit(`run fallback failed [${err2.code}]: ${err2.message}`);
-            }
-            const msg = err2 instanceof HarnessError
-              ? `jcode error [${err2.code}]: ${err2.message}`
-              : String(err2);
-            await renderer.safeSendMessage(chatId, `⚠️ ${msg}`, replyTo);
-          }
-        } else {
-          const msg = err instanceof HarnessError ? `jcode error [${err.code}]: ${err.message}` : String(err);
-          await renderer.finishWith(chatId, working, accumulated || `⚠️ ${msg}`);
-        }
-      } finally {
-        await child.close().catch(() => undefined);
+        await child.sendMessage(st.sessionId, content, { waitForAccept: false });
+      } catch (sendErr) {
+        // The frame may already have reached the daemon (half-failure).
+        // Never run() again on this content — that would execute the turn
+        // twice and double-reply.
+        console.error("[route] sendMessage failed (turn may have started):", sendErr);
       }
-    }).catch((err) => console.error("[route] queue error:", err));
-  } catch (err) {
-    console.error("[route] EXCEPTION:", err);
-    const msg = err instanceof HarnessError ? `jcode error [${err.code}]: ${err.message}` : String(err);
-    await renderer.safeSendMessage(chatId, `⚠️ ${msg}`, ctx.message?.message_id);
-  }
+      turnStarted = true;
+      console.log("[stream] consuming events");
+      let evCount = 0;
+      for await (const ev of child.events(st.sessionId)) {
+        if (ac.signal.aborted) break;
+        evCount++;
+        if (ev.ev === "turn_done") { console.log("[stream] turn_done, events:", evCount); break; }
+        if (ev.ev === "text_delta") {
+          accumulated += ev.text;
+          if (stream && !stream.failed) await stream.onDelta(ev.text);
+        } else if (ev.ev === "tool_start") {
+          const name = (ev as { name?: string }).name ?? "tool";
+          if (stream && !stream.failed) await stream.onToolStart(name);
+        }
+      }
+      console.log("[stream] loop end, events:", evCount, "failed:", stream?.failed);
+      if (ac.signal.aborted) {
+        // /cancel with a clean events() close: report once and stop.
+        await renderer
+          .safeSendMessage(chatId, "⏹ Cancelled.", replyTo)
+          .catch(() => undefined);
+        return;
+      }
+      if (stream && !stream.failed) {
+        await stream.finish();
+        console.log("[stream] finished");
+      } else {
+        // streaming disabled/never started: deliver collected text once
+        if (stream) stream.cancel();
+        await renderer.finishWith(chatId, working, accumulated);
+      }
+    } catch (err) {
+      if (ac.signal.aborted) {
+        // /cancel: the child was closed on purpose; don't report an error.
+        await renderer
+          .safeSendMessage(chatId, "⏹ Cancelled.", replyTo)
+          .catch(() => undefined);
+        return;
+      }
+      if (timedOut) return; // watchdog already reported the timeout
+      if (isFatalHarnessError(err)) throw err;
+      console.error("[route] stream error:", err);
+      if (stream) await stream.cancel();
+      if (canFallbackToRun(turnStarted)) {
+        // Safe to run() once: the turn never began on the daemon.
+        try {
+          const result = await client.run(st.sessionId, content, { autoApprove: true });
+          const w = working ?? (await renderer.sendWorking(chatId, replyTo));
+          await renderer.finishWith(chatId, w, result.text ?? "");
+        } catch (err2) {
+          if (isFatalHarnessError(err2)) throw err2;
+          const msg = err2 instanceof HarnessError
+            ? `jcode error [${err2.code}]: ${err2.message}`
+            : String(err2);
+          await renderer.safeSendMessage(chatId, `⚠️ ${msg}`, replyTo);
+        }
+      } else {
+        const msg = err instanceof HarnessError ? `jcode error [${err.code}]: ${err.message}` : String(err);
+        await renderer.finishWith(chatId, working, accumulated || `⚠️ ${msg}`);
+      }
+    } finally {
+      clearTimeout(watchdog);
+      activeTurns.delete(chatId);
+      await child.close().catch(() => undefined);
+    }
+  }).catch((err) => {
+    console.error("[route] queue error:", err);
+    if (isFatalHarnessError(err)) {
+      fatalExit(`queue turn failed [${(err as { code?: string }).code ?? ""}]: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const msg = err instanceof HarnessError
+      ? `jcode error [${err.code}]: ${err.message}`
+      : String(err);
+    void renderer
+      .safeSendMessage(chatId, `⚠️ ${msg}`, ctx.message?.message_id)
+      .catch(() => undefined);
+  });
 }
 
 console.log(`[bridge] started. bot=${cfg.botToken.split(":")[0]} allowed=${cfg.allowedIds.length ? cfg.allowedIds.join(",") : "(all)"} workdir=${cfg.workDir}`);
@@ -335,19 +389,18 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // Persisted poll offset: on restart we must NOT re-pull already-delivered
 // updates (getUpdates(offset=0) returns every unconfirmed update again, so a
 // crash/restart loop would re-handle the same message and re-send the same
-// reply — the "bot loops sending the same message" bug).
-const OFFSET_FILE = join(homedir(), "jcode-telegram-bridge", "poll-offset.txt");
+// reply — the "bot loops sending the same message" bug). Path derives from
+// stateFile so STATE_FILE relocation moves the offset too.
 function loadOffset(): number {
   try {
-    const n = Number(readFileSync(OFFSET_FILE, "utf8").trim());
-    return Number.isFinite(n) && n > 0 ? n : 0;
+    return parseOffset(readFileSync(cfg.offsetFile, "utf8"));
   } catch {
     return 0;
   }
 }
 function saveOffset(offset: number): void {
   try {
-    writeFileSync(OFFSET_FILE, String(offset), { mode: 0o600 });
+    writeFileSync(cfg.offsetFile, String(offset), { mode: 0o600 });
   } catch (err) {
     console.error("[bridge] save offset failed:", err);
   }
@@ -390,7 +443,7 @@ async function pollLoop(bot: Telegraf): Promise<void> {
       continue;
     }
     if (updates.length > 0) {
-      offset = updates.reduce((max, u) => Math.max(max, u.update_id), 0) + 1;
+      offset = advanceOffset(updates, offset);
       saveOffset(offset);
       await Promise.all(
         updates.map((u) => bot.handleUpdate(u as never).catch((e: unknown) => {
