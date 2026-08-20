@@ -32,6 +32,14 @@ jcode api-bridge ⇄ jcode daemon (shared live user session)
 | /cancel | Interrupt the current turn (verified: interrupts the daemon turn) |
 | /status | Bridge and daemon status (bridge-only) |
 
+## Voice STT (Hermes parity)
+
+- **Pipeline**: `voice/audio/video_note (.ogg/.opus)` -> `getFile + fetch -> /tmp` -> `tools/transcription_tools parity` -> quoted `"transcript"` + `caption` injected as `enriched_text` (mirrors `gateway/run.py:_enrich_message_with_transcription`).
+- **Defaults** (per local approval): `STT_LANGUAGE=zh` + `STT_LOCAL_MODEL=small` (`small` ~500MB, better zh WER than `base` on 2.2G box; `tiny`/`base`/`small`/`medium`/`large-v3` supported).
+- **Provider order**: explicit `STT_PROVIDER` wins; auto `local (faster-whisper) > groq (whisper-large-v3-turbo) > openai (whisper-1)` with fallback to local on cloud failure (Hermes `_get_provider`).
+- **Limits**: `25MB`, `SUPPORTED_FORMATS {.ogg/.opus/.mp3/.m4a/...}`; oversize/too-large echoes `[voice message too large]` and still delivers caption; `ffmpeg` transcodes `.ogg/.opus -> 16kHz mono 32k AAC m4a` for cloud endpoints.
+- **Echo**: `STT_ECHO_TRANSCRIPTS=true` sends `🎙️ "transcript"` before the agent turn (Hermes `_echo_pending_stt_transcripts_once`).
+
 ## Deployment
 
 ```bash

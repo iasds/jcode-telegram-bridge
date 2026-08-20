@@ -4,6 +4,7 @@ import https from "node:https";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { loadConfig } from "./config.js";
+import { enrichTextWithTranscript, transcribeAudio } from "./stt.js";
 import { SessionStore, QueueFullError } from "./sessions.js";
 import { TextBatchAggregator } from "./batch.js";
 import { TurnRenderer } from "./events.js";
@@ -299,9 +300,10 @@ bot.on("photo", (ctx) => {
   );
 });
 bot.on("voice", (ctx) => {
-  const chatId = ctx.chat.id;
-  if (!allowed(ctx.from?.id)) return;
-  mediaDeliver(chatId, ctx, "🎤 [voice message]");
+  void handleVoice(ctx, "voice").catch((err) => console.error("[bridge] voice handler error:", err));
+});
+bot.on("video_note", (ctx: any) => {
+  void handleVoice(ctx, "video_note").catch((err) => console.error("[bridge] video_note handler error:", err));
 });
 bot.on("video", (ctx) => {
   const chatId = ctx.chat.id;
@@ -313,10 +315,112 @@ bot.on("video", (ctx) => {
   );
 });
 bot.on("audio", (ctx) => {
-  const chatId = ctx.chat.id;
-  if (!allowed(ctx.from?.id)) return;
-  mediaDeliver(chatId, ctx, "🎵 [audio]");
+  // audio doc may be voice-like or music — treat as potential STT if small, else placeholder
+  const f = (ctx.message as any).audio;
+  const size = f?.file_size ?? 0;
+  if (size > 25 * 1024 * 1024 || !cfg.stt.enabled) {
+    const chatId = ctx.chat.id;
+    if (!allowed(ctx.from?.id)) return;
+    mediaDeliver(chatId, ctx, "🎵 [audio]");
+    return;
+  }
+  void handleVoice(ctx, "audio").catch((err) => console.error("[bridge] audio handler error:", err));
 });
+
+async function downloadTelegramFile(fileId: string): Promise<{ path: string; ext: string; durablePath: string } | null> {
+  const file: any = await bot.telegram.getFile(fileId);
+  if (!file?.file_path) return null;
+  const ext = file.file_path.includes(".") ? "." + file.file_path.split(".").pop()!.split("?")[0] : ".ogg";
+  const { tmpdir: getTmpdir } = await import("node:os");
+  const { join, basename: baseName } = await import("node:path");
+  const { writeFileSync, mkdirSync } = await import("node:fs");
+  const tmpPath = join(getTmpdir(), `jcode-voice-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+  const url = `https://api.telegram.org/file/bot${cfg.botToken}/${file.file_path}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} downloading voice`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  writeFileSync(tmpPath, buf);
+  // durable copy for the agent (tmp is deleted after STT; hermes keeps download dir)
+  const durableDir = join(cfg.workDir, ".jcode-media", "telegram-voice");
+  try { mkdirSync(durableDir, { recursive: true }); } catch {}
+  const rawBase = (file.file_path.split("/").pop() ?? `voice-${Date.now()}${ext}`).split("?")[0];
+  const durableName = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}-${baseName(rawBase)}`;
+  const finalDurable = durableName.includes(".") ? durableName : `${durableName}${ext}`;
+  const durablePath = join(durableDir, finalDurable);
+  try { writeFileSync(durablePath, buf); } catch (e) { console.error("[bridge] durable write failed:", e); }
+  return { path: tmpPath, ext, durablePath };
+}
+
+async function handleVoice(ctx: any, kind: "voice" | "audio" | "video_note"): Promise<void> {
+  const chatId = ctx.chat?.id;
+  const fromId = ctx.from?.id;
+  if (!chatId || !allowed(fromId)) return;
+  if (cfg.chatOnly && ctx.chat?.type !== "private") return;
+  renderer.cacheContext(chatId, ctx);
+  lastCtx.set(chatId, ctx);
+
+  const caption: string = ctx.message?.caption ?? "";
+  // Extract file_id by kind
+  let fileId: string | undefined;
+  let fileSize = 0;
+  if (kind === "voice") { fileId = ctx.message?.voice?.file_id; fileSize = ctx.message?.voice?.file_size ?? 0; }
+  else if (kind === "video_note") { fileId = ctx.message?.video_note?.file_id; fileSize = ctx.message?.video_note?.file_size ?? 0; }
+  else if (kind === "audio") { fileId = ctx.message?.audio?.file_id; fileSize = ctx.message?.audio?.file_size ?? 0; }
+
+  if (!fileId) {
+    mediaDeliver(chatId, ctx, kind === "voice" ? "🎤 [voice message]" : `🎵 [${kind}]`);
+    return;
+  }
+  if (fileSize > 25 * 1024 * 1024) {
+    mediaDeliver(chatId, ctx, `🎤 [voice message too large: ${fmtBytes(fileSize)} — not transcribed]${caption ? ` Caption: ${caption}` : ""}`);
+    return;
+  }
+  if (!cfg.stt.enabled) {
+    mediaDeliver(chatId, ctx, `🎤 [voice message]${caption ? ` Caption: ${caption}` : ""}`);
+    return;
+  }
+
+  // Notify user we're transcribing (typing action)
+  void bot.telegram.sendChatAction(chatId, "typing").catch(() => undefined);
+
+  let tmpPath: string | null = null;
+  let durableVoicePath: string | null = null;
+  try {
+    const dl = await downloadTelegramFile(fileId);
+    if (!dl) throw new Error("getFile returned no file_path");
+    tmpPath = dl.path;
+    durableVoicePath = (dl as any).durablePath as string | null;
+    // transcribe with bridge stt config (zh/small by default)
+    const sttCfg = { enabled: cfg.stt.enabled, echoTranscripts: cfg.stt.echoTranscripts, provider: cfg.stt.provider, language: cfg.stt.language, localModel: cfg.stt.localModel } as any;
+    const res = await transcribeAudio(tmpPath, sttCfg);
+    if (res.success && res.transcript.trim()) {
+      const enriched = enrichTextWithTranscript(caption, [res.transcript]);
+      if (cfg.stt.echoTranscripts) {
+        // Echo like hermes gateway/run.py _echo_pending_stt_transcripts_once: 🎙️ "transcript"
+        void renderer.safeSendMessage(chatId, `🎙️ "${res.transcript.trim()}"`, ctx.message?.message_id).catch(() => undefined);
+      }
+      console.log(`[stt] ${kind} -> ${res.provider} ${res.transcript.slice(0, 80)}…`);
+      const withFile = durableVoicePath ? `${enriched}\n\n[attached audio file: ${durableVoicePath}]` : enriched;
+      mediaDeliver(chatId, ctx, withFile);
+    } else {
+      const errNote = res.error ?? "unknown error";
+      console.warn(`[stt] ${kind} failed [${res.provider}]: ${errNote}`);
+      const unavailableAnchor = durableVoicePath ?? tmpPath ?? undefined;
+      let enriched = enrichTextWithTranscript(caption, [], unavailableAnchor);
+      if (durableVoicePath) enriched += `\n\n[attached audio file: ${durableVoicePath}]`;
+      // enriched here is the unavailable note + caption
+      mediaDeliver(chatId, ctx, enriched);
+      if (caption) {
+        // also log for operator
+      }
+    }
+  } catch (err: any) {
+    console.error(`[stt] ${kind} error:`, err?.message ?? err);
+    mediaDeliver(chatId, ctx, `🎤 [voice message — transcription failed: ${String(err?.message ?? err).slice(0, 200)}]${caption ? ` Caption: ${caption}` : ""}`);
+  } finally {
+    if (tmpPath) { try { const { unlinkSync } = await import("node:fs"); unlinkSync(tmpPath); } catch {} }
+  }
+}
 bot.on("sticker", (ctx) => {
   const chatId = ctx.chat.id;
   if (!allowed(ctx.from?.id)) return;

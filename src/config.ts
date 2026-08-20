@@ -2,6 +2,19 @@ import "dotenv/config";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 
+export interface SttConfig {
+  /** STT enabled (STT_ENABLED, default true). */
+  enabled: boolean;
+  /** Echo transcript back as 🎙️ quote before feeding agent (STT_ECHO_TRANSCRIPTS, default true). */
+  echoTranscripts: boolean;
+  /** Explicit provider ""=auto, else local/groq/openai (STT_PROVIDER). */
+  provider: string;
+  /** Language hint, default zh (STT_LANGUAGE / HERMES_LOCAL_STT_LANGUAGE). */
+  language: string;
+  /** Local faster-whisper model, default small per user choice (STT_LOCAL_MODEL). */
+  localModel: string;
+}
+
 export interface Config {
   botToken: string;
   allowedIds: number[];
@@ -19,6 +32,8 @@ export interface Config {
   enableReactions: boolean;
   /** Only respond in private chats; ignore all groups/channels. */
   chatOnly: boolean;
+  /** Speech-to-text config (mirrors hermes stt section, defaults small+zh). */
+  stt: SttConfig;
 }
 
 function parseIds(raw: string | undefined): number[] {
@@ -29,6 +44,14 @@ function parseIds(raw: string | undefined): number[] {
     .filter(Boolean)
     .map((s) => Number(s))
     .filter((n) => Number.isFinite(n) && n > 0);
+}
+
+function parseBool(raw: string | undefined, defaultVal: boolean): boolean {
+  if (raw === undefined || raw === "") return defaultVal;
+  const v = raw.toLowerCase().trim();
+  if (["0", "false", "off", "no", "disable", "disabled"].includes(v)) return false;
+  if (["1", "true", "on", "yes", "enable", "enabled"].includes(v)) return true;
+  return defaultVal;
 }
 
 export function loadConfig(): Config {
@@ -59,5 +82,12 @@ export function loadConfig(): Config {
     disableLinkPreviews: (process.env.DISABLE_LINK_PREVIEWS ?? "").toLowerCase() === "true",
     enableReactions: (process.env.ENABLE_REACTIONS ?? "").toLowerCase() === "true",
     chatOnly: (process.env.TELEGRAM_CHAT_ONLY ?? "").toLowerCase() === "true",
+    stt: {
+      enabled: parseBool(process.env.STT_ENABLED, true),
+      echoTranscripts: parseBool(process.env.STT_ECHO_TRANSCRIPTS, true),
+      provider: (process.env.STT_PROVIDER ?? process.env.STT_MODEL_PROVIDER ?? "").trim(),
+      language: (process.env.STT_LANGUAGE ?? process.env.HERMES_LOCAL_STT_LANGUAGE ?? "zh").trim() || "zh",
+      localModel: (process.env.STT_LOCAL_MODEL ?? "small").trim() || "small",
+    },
   };
 }
