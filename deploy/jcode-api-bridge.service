@@ -1,10 +1,11 @@
 [Unit]
 Description=jcode Harness API bridge (SDK unix socket)
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
-StartLimitIntervalSec=120
 ExecStart=/home/user/bin/jcode api-bridge
-Restart=always
+Restart=on-failure
 RestartSec=2
 
 [Install]

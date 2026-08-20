@@ -1,8 +1,9 @@
 import { JcodeClient, HarnessError } from "@1jehuang/jcode-sdk";
 import { Telegraf } from "telegraf";
 import https from "node:https";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, statSync, unlinkSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { spawn } from "node:child_process";
 import { loadConfig } from "./config.js";
 import { enrichTextWithTranscript, transcribeAudio } from "./stt.js";
 import { SessionStore, QueueFullError } from "./sessions.js";
@@ -19,6 +20,97 @@ import {
 } from "./logic.js";
 
 const cfg = loadConfig();
+
+// ── STT concurrency (S4) ──────────────────────────────────────────────
+let sttRunning = 0;
+const STT_CONCURRENCY = 2;
+const sttWaiters: Array<() => void> = [];
+async function withSttSlot<T>(fn: () => Promise<T>): Promise<T> {
+  while (sttRunning >= STT_CONCURRENCY) await new Promise<void>((r) => sttWaiters.push(r));
+  sttRunning++;
+  try {
+    return await fn();
+  } finally {
+    sttRunning--;
+    const w = sttWaiters.shift();
+    if (w) w();
+  }
+}
+
+// ── harness retry (S3) ───────────────────────────────────────────────
+async function withHarnessRetry<T>(label: string, fn: () => Promise<T>, retries = 3): Promise<T> {
+  let last: unknown;
+  for (let i = 1; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      last = e;
+      if (isFatalHarnessError(e)) throw e;
+      if (i === retries) break;
+      console.warn(`[harness] ${label} attempt ${i}/${retries} failed: ${e instanceof Error ? e.message : String(e)}; retrying`);
+      await new Promise((r) => setTimeout(r, 800 * i));
+    }
+  }
+  throw last;
+}
+
+// ── durable pruning (S5) ─────────────────────────────────────────────
+function pruneVoiceDurables(): void {
+  try {
+    const dir = join(cfg.workDir, ".jcode-media", "telegram-voice");
+    if (!existsSync(dir)) return;
+    const now = Date.now();
+    const maxAgeMs = 7 * 24 * 3600 * 1000;
+    const maxBytes = 500 * 1024 * 1024;
+    const entries: string[] = readdirSync(dir);
+    type Ent = { name: string; mtime: number; size: number };
+    const items: Ent[] = [];
+    let total = 0;
+    for (const name of entries) {
+      const p = join(dir, name);
+      try {
+        const st = statSync(p);
+        if (!st.isFile()) continue;
+        if (now - st.mtimeMs > maxAgeMs) {
+          try { unlinkSync(p); } catch {}
+          continue;
+        }
+        items.push({ name, mtime: st.mtimeMs, size: st.size });
+        total += st.size;
+      } catch {}
+    }
+    if (total > maxBytes) {
+      items.sort((a, b) => a.mtime - b.mtime);
+      for (const it of items) {
+        if (total <= maxBytes) break;
+        try { unlinkSync(join(dir, it.name)); total -= it.size; } catch {}
+      }
+      console.log(`[prune] voice durables pruned to ${(total / 1024 / 1024).toFixed(1)}MB`);
+    }
+  } catch (e) {
+    console.warn("[prune] voice prune failed:", e);
+  }
+}
+
+async function warmupStt(): Promise<void> {
+  if (!cfg.stt.enabled) return;
+  const t0 = Date.now();
+  try {
+    const model = cfg.stt.localModel || "small";
+    const code = `from faster_whisper import WhisperModel; m=WhisperModel("${model}", device="cpu", compute_type="int8"); print("warmup ok")`;
+    await new Promise<void>((resolve) => {
+      const p = spawn("python3", ["-c", code], { timeout: 120_000 } as any);
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      p.on("error", finish);
+      p.on("close", finish);
+      setTimeout(finish, 120_000);
+    });
+    console.log(`[stt] warmup ${model} done in ${Date.now() - t0}ms`);
+  } catch (e) {
+    console.warn(`[stt] warmup failed after ${Date.now() - t0}ms:`, e);
+  }
+}
 
 async function connectWithRetry(): Promise<JcodeClient> {
   let lastErr: unknown;
@@ -110,7 +202,7 @@ const textBatcher = new TextBatchAggregator(
     const ctx = lastCtx.get(chatId);
     if (ctx) void route(ctx, text);
   },
-  { maxWaitMs: 500 },
+  { maxWaitMs: 800 },
 );
 // Persisted home channel (alongside state.json).
 const HOME_FILE = join(dirname(cfg.stateFile), "home.json");
@@ -273,7 +365,7 @@ async function handleDocument(ctx: any): Promise<void> {
   try {
     const f = await ctx.telegram.getFile(doc.file_id);
     if (!f.file_path) throw new Error("no file_path");
-    const res = await fetch(`https://api.telegram.org/file/bot${cfg.botToken}/${f.file_path}`);
+    const res = await fetch(`https://api.telegram.org/file/bot${cfg.botToken}/${f.file_path}`, { signal: AbortSignal.timeout(15_000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const content = await res.text();
     mediaDeliver(
@@ -336,7 +428,7 @@ async function downloadTelegramFile(fileId: string): Promise<{ path: string; ext
   const { writeFileSync, mkdirSync } = await import("node:fs");
   const tmpPath = join(getTmpdir(), `jcode-voice-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
   const url = `https://api.telegram.org/file/bot${cfg.botToken}/${file.file_path}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`HTTP ${res.status} downloading voice`);
   const buf = Buffer.from(await res.arrayBuffer());
   writeFileSync(tmpPath, buf);
@@ -390,9 +482,11 @@ async function handleVoice(ctx: any, kind: "voice" | "audio" | "video_note"): Pr
     if (!dl) throw new Error("getFile returned no file_path");
     tmpPath = dl.path;
     durableVoicePath = (dl as any).durablePath as string | null;
-    // transcribe with bridge stt config (zh/small by default)
+    // transcribe with bridge stt config (zh/small by default) — gated by concurrency (S4)
     const sttCfg = { enabled: cfg.stt.enabled, echoTranscripts: cfg.stt.echoTranscripts, provider: cfg.stt.provider, language: cfg.stt.language, localModel: cfg.stt.localModel } as any;
-    const res = await transcribeAudio(tmpPath, sttCfg);
+    const t0 = Date.now();
+    const res = await withSttSlot(() => transcribeAudio(tmpPath!, sttCfg));
+    console.log(`[stt] ${kind} ${res.success ? "ok" : "fail"} provider=${res.provider} dur=${Date.now() - t0}ms`);
     if (res.success && res.transcript.trim()) {
       const enriched = enrichTextWithTranscript(caption, [res.transcript]);
       if (cfg.stt.echoTranscripts) {
@@ -460,9 +554,9 @@ async function route(ctx: any, text: string): Promise<void> {
     chatId,
       async () => {
         // -- session lookup + attach (serialized per chat) -----------------
-        let st = await store.getOrCreate(chatId);
+        let st = await withHarnessRetry("getOrCreate", () => store.getOrCreate(chatId));
         try {
-          await client.attachSession(st.sessionId);
+          await withHarnessRetry("attach", () => client.attachSession(st.sessionId));
         lastAttachSession = st.sessionId;
       } catch (err) {
         // Session is missing on the daemon (cleared/pruned/daemon restart) or
@@ -476,12 +570,12 @@ async function route(ctx: any, text: string): Promise<void> {
         );
         const mode = st.mode; // preserve plan mode across rotation
         store.remove(chatId);
-        st = await store.getOrCreate(chatId);
+        st = await withHarnessRetry("getOrCreate(retry)", () => store.getOrCreate(chatId));
         if (st.mode !== mode) {
           st = { ...st, mode };
           store.set(chatId, st);
         }
-        await client.attachSession(st.sessionId);
+        await withHarnessRetry("attach(retry)", () => client.attachSession(st.sessionId));
         lastAttachSession = st.sessionId;
       }
       const content =
@@ -647,6 +741,8 @@ async function route(ctx: any, text: string): Promise<void> {
 }
 
 console.log(`[bridge] started. bot=${cfg.botToken.split(":")[0]} allowed=${cfg.allowedIds.length ? cfg.allowedIds.join(",") : "(all)"} workdir=${cfg.workDir}`);
+pruneVoiceDurables();
+void warmupStt();
 
 bot.catch((err, ctx) => {
   console.error("[bridge] bot error:", err, "ctx:", ctx?.update?.update_id);

@@ -157,10 +157,25 @@ export class StreamingRenderer {
     if (this.accumulated.trim()) {
       await this.edit(formatMessage(this.accumulated), true);
     }
-    try {
-      await this.bot.telegram.sendMessage(this.chatId, `${toolEmoji(name)} [${formatMessage(name)}]`);
-    } catch (err) {
-      console.error("[stream] tool line failed:", err);
+    // Tool line: reuse 429 backoff (same as edit/sendChunk) so a flood on
+    // tool lines doesn't silently drop the line.
+    {
+      const text = `${toolEmoji(name)} [${formatMessage(name)}]`;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await this.bot.telegram.sendMessage(this.chatId, text);
+          break;
+        } catch (err) {
+          if (String(err).includes("429") && attempt < 2) {
+            const wait = retryAfterMs(err) ?? 2000;
+            console.warn(`[stream] 429 tool line, waiting ${wait}ms`);
+            await sleep(wait);
+            continue;
+          }
+          console.error("[stream] tool line failed:", err);
+          break;
+        }
+      }
     }
     this.accumulated = "";
     this.lastEditAt = 0;

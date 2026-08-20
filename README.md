@@ -121,8 +121,15 @@ npm test   # node --test — 40 cases (markdown 14, stream 14, truncate, logic 1
 - **Stream stages**: `[stream] connect → connected → attach → attached →
   consuming events → turn_done (N events) → loop end → finished`. If it
   stops before `attached`, the session is likely broken (rotation kicks in).
+- **STT**: each voice logs `[stt] voice ok|fail provider=… dur=…ms`; a cold
+  start warms `faster-whisper small (zh)` once at boot (`[stt] warmup … done`),
+  concurrent voices are capped at 2. Failed transcripts still leave the
+  durable `.jcode-media/telegram-voice/*.ogg` for the agent and log the anchor
+  path. Pruning runs at boot (keep 7d / 500MB).
 - **Silent bridge**: watch journald for `getUpdates error`, `429` retries,
   and `NRestarts` (`systemctl --user show jcode-tg-bridge.service -p NRestarts`).
+- **Config hardening**: `TURN_TIMEOUT_MS` (10s–30min) and `QUEUE_LIMIT` (1–20)
+  are clamped; unknown `STT_LOCAL_MODEL` falls back to `small` with a warning.
 - **Commands vs TUI**: /status and /info are bridge-only; all others align
   with the jcode TUI. Unknown commands are rejected, never sent to the agent.
 

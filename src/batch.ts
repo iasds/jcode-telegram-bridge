@@ -46,7 +46,7 @@ export class TextBatchAggregator {
     private readonly flushFn: FlushFn,
     opts: TextBatchOptions = {},
   ) {
-    this.maxWaitMs = opts.maxWaitMs ?? 1000;
+    this.maxWaitMs = opts.maxWaitMs ?? 800;
     this.join = opts.join ?? "\n";
     this.schedule =
       opts.schedule ??

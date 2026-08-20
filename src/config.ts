@@ -2,6 +2,9 @@ import "dotenv/config";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 
+/** Faster-whisper model ids we actually host / will download. */
+export const ALLOWED_STT_MODELS = new Set(["tiny", "base", "small", "medium", "large-v3", "large"] as const);
+
 export interface SttConfig {
   /** STT enabled (STT_ENABLED, default true). */
   enabled: boolean;
@@ -54,6 +57,26 @@ function parseBool(raw: string | undefined, defaultVal: boolean): boolean {
   return defaultVal;
 }
 
+function clampInt(raw: string | undefined, def: number, min: number, max: number, label: string): number {
+  if (raw === undefined || raw === "") return def;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.warn(`[config] invalid ${label}=${JSON.stringify(raw)} — using default ${def}`);
+    return def;
+  }
+  const clamped = Math.max(min, Math.min(max, Math.trunc(n)));
+  if (clamped !== n) console.warn(`[config] ${label}=${n} clamped to ${clamped}`);
+  return clamped;
+}
+
+function normalizeSttModel(raw: string | undefined): string {
+  const v = (raw ?? "small").trim().toLowerCase() || "small";
+  if ((ALLOWED_STT_MODELS as Set<string>).has(v)) return v;
+  if (v === "large-v2") return "large-v3";
+  console.warn(`[config] unknown STT_LOCAL_MODEL=${JSON.stringify(raw)} — using small`);
+  return "small";
+}
+
 export function loadConfig(): Config {
   const token = process.env.TELEGRAM_BOT_TOKEN ?? "";
   if (!token) {
@@ -72,22 +95,22 @@ export function loadConfig(): Config {
     workDir,
     stateFile,
     offsetFile: join(dirname(stateFile), "poll-offset.txt"),
-    turnTimeoutMs: Number(process.env.TURN_TIMEOUT_MS ?? 10 * 60 * 1000),
-    queueLimit: Number(process.env.QUEUE_LIMIT ?? 5),
+    turnTimeoutMs: clampInt(process.env.TURN_TIMEOUT_MS, 10 * 60 * 1000, 10_000, 30 * 60 * 1000, "TURN_TIMEOUT_MS"),
+    queueLimit: clampInt(process.env.QUEUE_LIMIT, 5, 1, 20, "QUEUE_LIMIT"),
     planPrompt:
       process.env.PLAN_PROMPT ??
       "[Plan mode] Only output an execution plan (step list, files involved, risks). Do not run any tools, do not modify any files. Wait for user confirmation before executing.",
     planModePrefix:
       process.env.PLAN_MODE_PREFIX ?? "[Plan mode] Plan only, do not execute.",
-    disableLinkPreviews: (process.env.DISABLE_LINK_PREVIEWS ?? "").toLowerCase() === "true",
-    enableReactions: (process.env.ENABLE_REACTIONS ?? "").toLowerCase() === "true",
-    chatOnly: (process.env.TELEGRAM_CHAT_ONLY ?? "").toLowerCase() === "true",
+    disableLinkPreviews: parseBool(process.env.DISABLE_LINK_PREVIEWS, false),
+    enableReactions: parseBool(process.env.ENABLE_REACTIONS, false),
+    chatOnly: parseBool(process.env.TELEGRAM_CHAT_ONLY, false),
     stt: {
       enabled: parseBool(process.env.STT_ENABLED, true),
       echoTranscripts: parseBool(process.env.STT_ECHO_TRANSCRIPTS, true),
       provider: (process.env.STT_PROVIDER ?? process.env.STT_MODEL_PROVIDER ?? "").trim(),
       language: (process.env.STT_LANGUAGE ?? process.env.HERMES_LOCAL_STT_LANGUAGE ?? "zh").trim() || "zh",
-      localModel: (process.env.STT_LOCAL_MODEL ?? "small").trim() || "small",
+      localModel: normalizeSttModel(process.env.STT_LOCAL_MODEL),
     },
   };
 }
