@@ -35,13 +35,14 @@ dog(startup/throughput), dove(input security), eagle(supply chain). Wave-1 assig
 | ST-04 | LOW | cricket F6 | bridge.ts:557-594 | getOrCreate+attach strictly after STT; zero input dependency | prefetch in parallel with download/STT | ~15L |
 | M-01 | LOW | dog F7/F8 | events.ts:32, bridge.ts:196-198, sessions.ts:93 | unbounded Maps (ctxCache/lastCtx/lastUserTexts/queue tails) | LRU cap or delete-on-clear | ~17L |
 
-## Backlog (needs Caesar approval per charter)
+## Backlog — RESOLVED 2026-08-21 (Caesar approved "按你的来")
 
-| ID | Item | Why deferred |
+| ID | Item | Outcome |
 |---|---|---|
-| B-01 | Resident python STT worker (cricket F1): stt.py stdin JSON-lines daemon, model stays loaded; −1.2–3s/request, ~30-35% total voice latency cut | >100 LOC redesign |
-| B-02 | In-process harness reconnect instead of process.exit(1) (cow F1) | ~30L, changes recovery semantics; current systemd restart works |
-| B-03 | Token rotation at BotFather + local reflog expire/gc (eagle F-01): unreachable local blobs tgmin.mjs/tgcombo.mjs contain live-token-format string; NOT on origin | requires Caesar action at BotFather |
+| B-01 | Resident python STT worker | DONE commit 58c4500. stt_worker.py JSON-lines daemon, model resident; warm transcribe 7.7s → 3.0–3.5s (−55%); self-heal respawn + inline fallback kept |
+| B-02 | In-process harness reconnect | WON'T DO (deliberate): saves only ~3–5s vs systemd restart; adds reconnect state machine + double-connection risk on top of P-01 gate. S-02 grace already protects in-flight turns. Revisit only if restarts become frequent |
+| B-03 | Local blob purge + token rotation | Purge DONE (reflog expire + gc --prune=now; 33eda3e unreachable, reachable history verified clean). Token rotation at BotFather remains a 2-min manual step for Caesar — recommended |
+| B-04 | /status etc. during connect window | NO CHANGE NEEDED: /status and /info already wrap client calls in try/catch with friendly "daemon connection failed" replies |
 
 ## Clean bills (no action)
 - Path traversal via file_name (dove), command injection (all arg-array spawn), TOCTOU ALLOWED_IDS,
