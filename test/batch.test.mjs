@@ -176,6 +176,47 @@ test("isLikelyTextChunk: custom threshold", () => {
   assert.equal(isLikelyTextChunk("x".repeat(10), "y", 0), true, "threshold 0 means every previous message qualifies");
 });
 
+// ── ST-03: pushNow immediate flush ─────────────────────────────────────────
+
+test("pushNow: flushes synchronously, no quiet-period wait, other chats unaffected", async () => {
+  const calls = [];
+  const agg = new TextBatchAggregator((chatId, text) => calls.push({ chatId, text }), {
+    maxWaitMs: 30,
+  });
+  // A text burst is already buffered for chat 2 (quiet timer pending).
+  agg.push(2, "burst part");
+  assert.equal(agg.pendingCount(), 1);
+
+  agg.pushNow(7, "voice transcript");
+  assert.deepEqual(calls, [{ chatId: 7, text: "voice transcript" }],
+    "pushNow must invoke the flush callback synchronously (before any timer)");
+  assert.equal(agg.pendingCount(), 1, "chat 2's pending buffer must be untouched");
+
+  await sleep(80);
+  assert.deepEqual(calls, [
+    { chatId: 7, text: "voice transcript" },
+    { chatId: 2, text: "burst part" },
+  ], "chat 2 still flushes via its own quiet timer; chat 7 must NOT flush again");
+});
+
+test("pushNow: coalesces with an in-flight buffer and cancels its timer", () => {
+  const scheduled = [];
+  const calls = [];
+  const agg = new TextBatchAggregator(
+    (chatId, text) => calls.push({ chatId, text }),
+    { schedule: fakeSchedule(scheduled) },
+  );
+  agg.push(5, "earlier text"); // arms a quiet timer
+  agg.pushNow(5, "urgent voice note");
+  // Both parts go out together, ordering preserved, single synchronous flush.
+  assert.deepEqual(calls, [{ chatId: 5, text: "earlier text\nurgent voice note" }]);
+  assert.equal(agg.pendingCount(), 0);
+  // Firing every armed (now stale) timer must not produce a duplicate
+  // delivery: the flush removed the buffer and cancelled its timers.
+  for (const fn of scheduled) fn();
+  assert.equal(calls.length, 1, "no duplicate flush from stale timers after pushNow");
+});
+
 // ── P-03-lite: hardCapMs starvation guard ──────────────────────────────────
 
 /** Manual-clock scheduler harness for deterministic timer tests. */

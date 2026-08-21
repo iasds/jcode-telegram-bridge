@@ -291,6 +291,23 @@ function cancelTurn(chatId: number): void {
 const lastUserTexts = new Map<number, string>();
 // Cached ctx per chat (for batched flush + /retry re-route).
 const lastCtx = new Map<number, any>();
+
+/**
+ * M-01b: bounded Map insert. These caches only serve /retry and the batched
+ * flush of the NEXT message; keeping unbounded per-chat entries forever is a
+ * slow leak (one entry per chat ever seen). Insertion-ordered eviction: at
+ * cap, the OLDEST inserted key is dropped. Re-inserting an existing key does
+ * not evict anything and keeps its original position (Map semantics), which
+ * matches "oldest chat gets forgotten first".
+ */
+const CACHE_CAP = 64;
+function cappedSet<V>(map: Map<number, V>, key: number, value: V, cap = CACHE_CAP): void {
+  if (!map.has(key) && map.size >= cap) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
 // Quiet-period text aggregation for >4096 message splits (C14).
 const textBatcher = new TextBatchAggregator(
   (chatId, text) => {
@@ -397,7 +414,7 @@ bot.on("text", async (ctx) => {
     return;
   }
   renderer.cacheContext(chat.id, ctx);
-  lastCtx.set(chat.id, ctx);
+  cappedSet(lastCtx, chat.id, ctx);
   if (cfg.chatOnly && chat.type !== "private") {
     console.log(`[bridge] ignored ${chat.type} message (chat-only mode) from ${fromId}`);
     return;
@@ -431,11 +448,14 @@ bot.on("text", async (ctx) => {
 const TEXT_EXT = /\.(txt|md|markdown|json|log|csv|py|js|ts|tsx|jsx|go|rs|java|c|cpp|h|hpp|sh|bash|zsh|yaml|yml|toml|ini|xml|html|css|sql|env|conf|cfg)$/i;
 const MAX_INLINE_DOC_BYTES = 100_000;
 
-function mediaDeliver(chatId: number, ctx: any, text: string): void {
+function mediaDeliver(chatId: number, ctx: any, text: string, immediate = false): void {
   if (cfg.chatOnly && ctx.chat?.type !== "private") return;
-  lastCtx.set(chatId, ctx);
+  cappedSet(lastCtx, chatId, ctx);
   renderer.cacheContext(chatId, ctx);
-  textBatcher.push(chatId, text);
+  // ST-03: single-part deliveries that gain nothing from batching (voice
+  // transcripts) flush immediately instead of idling out the quiet window.
+  if (immediate) textBatcher.pushNow(chatId, text);
+  else textBatcher.push(chatId, text);
 }
 
 function fmtBytes(n: number): string {
@@ -448,6 +468,12 @@ async function handleDocument(ctx: any): Promise<void> {
   const chatId = ctx.chat.id;
   const fromId = ctx.from?.id;
   if (!chatId || !allowed(fromId)) return;
+  // ST-04: fire-and-forget session prefetch, same rationale as handleVoice —
+  // the inline-doc fetch below can take seconds; overlap the daemon
+  // round-trip with it. Set unconditionally at entry so every downstream
+  // mediaDeliver->route() turn body can await it (see ordering proof there).
+  const sessionPrefetch = store.getOrCreateSafe(chatId).catch(() => undefined);
+  (ctx as any).__sessionPrefetch = sessionPrefetch;
   const doc = ctx.message.document;
   const name = doc.file_name ?? "document";
   const size = doc.file_size ?? 0;
@@ -472,6 +498,7 @@ async function handleDocument(ctx: any): Promise<void> {
       chatId,
       ctx,
       `[Content of ${name}]:\n${content}${caption ? `\n\nCaption: ${caption}` : ""}`,
+      true, // inline docs are also single-part deliveries: skip the quiet wait
     );
   } catch (err) {
     console.error("[bridge] document fetch failed:", err);
@@ -548,8 +575,10 @@ async function handleVoice(ctx: any, kind: "voice" | "audio" | "video_note"): Pr
   const fromId = ctx.from?.id;
   if (!chatId || !allowed(fromId)) return;
   if (cfg.chatOnly && ctx.chat?.type !== "private") return;
-  renderer.cacheContext(chatId, ctx);
-  lastCtx.set(chatId, ctx);
+  if (!cfg.chatOnly || ctx.chat?.type === "private") {
+    renderer.cacheContext(chatId, ctx);
+    cappedSet(lastCtx, chatId, ctx);
+  }
 
   const caption: string = ctx.message?.caption ?? "";
   // Extract file_id by kind
@@ -574,6 +603,14 @@ async function handleVoice(ctx: any, kind: "voice" | "audio" | "video_note"): Pr
 
   // Notify user we're transcribing (typing action)
   void bot.telegram.sendChatAction(chatId, "typing").catch(() => undefined);
+
+  // ST-04: the session lookup has ZERO dependency on user input (download,
+  // STT, caption — none of it feeds getOrCreate). Fire-and-forget prefetch so
+  // the daemon round-trip overlaps download+transcription instead of serializing
+  // after it inside route()'s queue. Consumed in route(); see the ordering
+  // proof there for why awaiting it inside the turn cannot deadlock.
+  const sessionPrefetch = store.getOrCreateSafe(chatId).catch(() => undefined);
+  (ctx as any).__sessionPrefetch = sessionPrefetch;
 
   let tmpPath: string | null = null;
   let durableVoicePath: string | null = null;
@@ -648,7 +685,7 @@ async function route(ctx: any, text: string): Promise<void> {
   // messages can never attach the same session concurrently (a rotation on
   // one could race the other's attach and double-create). Turns are
   // fire-and-forget so telegraf keeps processing updates (e.g. /cancel).
-  lastUserTexts.set(chatId, trimmed);
+  cappedSet(lastUserTexts, chatId, trimmed);
   const userMsgId = ctx.message?.message_id;
   void store.enqueue(
     chatId,
@@ -663,6 +700,31 @@ async function route(ctx: any, text: string): Promise<void> {
           );
         }
         // -- session lookup + attach (serialized per chat) -----------------
+        // ST-04: consume the handler-entry session prefetch (voice/document
+        // paths set ctx.__sessionPrefetch). Ordering proof that this await
+        // cannot deadlock and the prefetch can never land AFTER this turn:
+        //   1. Handlers run OUTSIDE every queue. At entry they call
+        //      getOrCreateSafe -> store.enqueue(chatId, prefetchTask): the
+        //      prefetch is task A, appended to the per-chat FIFO tail.
+        //   2. This turn body becomes task B, enqueued strictly LATER — for
+        //      voice only after download+STT complete and the immediate batch
+        //      flush invokes route(). SessionStore.enqueue chains via
+        //      prev.then(fn), so arrival order == execution order.
+        //   3. Hence A finishes before B starts; when this line executes the
+        //      prefetch promise is already settled and `await` returns on the
+        //      microtask queue. The .catch(() => undefined) at creation means
+        //      it can never reject into the turn.
+        //   4. No interleaving exists that would order A after B within one
+        //      message's lifetime: only the message's own handler creates the
+        //      prefetch, synchronously before any await. Competing enqueues
+        //      from OTHER events (commands, other chats' messages) may slot
+        //      between A and B — they just delay both equally, order intact.
+        //   5. Worst case the prefetch failed (daemon down): getOrCreate below
+        //      retries with harness backoff exactly as before.
+        // getOrCreate still runs: it now hits the warm path (chats[key] was
+        // populated by the prefetch) instead of a second daemon round-trip.
+        const sessionPrefetch: Promise<unknown> | undefined = (ctx as any).__sessionPrefetch;
+        if (sessionPrefetch) await sessionPrefetch;
         let st = await withHarnessRetry("getOrCreate", () => store.getOrCreate(chatId));
         try {
           await withHarnessRetry("attach", () => client.attachSession(st.sessionId));

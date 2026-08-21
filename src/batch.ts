@@ -83,6 +83,21 @@ export class TextBatchAggregator {
     this.resetTimer(chatId, buf);
   }
 
+  /**
+   * Buffer text for chatId and flush that chat's buffer immediately,
+   * bypassing the quiet-period timer (ST-03).
+   *
+   * Use for single-part deliveries that gain nothing from batching — e.g. a
+   * voice transcript is one complete message; waiting maxWaitMs only adds
+   * latency. Batching exists to re-merge >4096-char text-message splits.
+   * If the chat already had buffered parts (a text burst in flight), they are
+   * coalesced into the same flush so ordering is preserved.
+   */
+  pushNow(chatId: number, text: string): void {
+    this.push(chatId, text);
+    this.flushChat(chatId);
+  }
+
   /** Flush one chat immediately, or all chats when chatId is omitted. */
   flush(chatId?: number): void {
     if (chatId !== undefined) {
