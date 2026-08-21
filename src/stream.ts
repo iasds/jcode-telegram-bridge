@@ -78,6 +78,12 @@ export class StreamingRenderer {
   private floodStrikes = 0;
   private cancelled = false;
   private editIntervalMs = EDIT_INTERVAL_MS;
+  // Codepoint count of `accumulated`, maintained incrementally per delta
+  // (P-04). Spreading the whole accumulated buffer on every delta was
+  // O(n²) over a long stream; counting only the NEW text is O(delta).
+  // Invariant: valid while `accumulated` is only mutated via onDelta()
+  // and reset to "" in onToolStart(); direct external assignment bypasses it.
+  private cpCount = 0;
 
   constructor(
     private bot: Telegraf,
@@ -142,10 +148,10 @@ export class StreamingRenderer {
   async onDelta(text: string): Promise<void> {
     if (this.failed) return;
     this.accumulated += text;
+    this.cpCount += [...text].length; // count only the new chunk, never re-spread the buffer
     const now = this.now();
     const elapsed = now - this.lastEditAt;
-    const cpLen = [...this.accumulated].length;
-    if ((elapsed >= this.editIntervalMs && this.accumulated.length > 0) || cpLen >= BUFFER_THRESHOLD) {
+    if ((elapsed >= this.editIntervalMs && this.accumulated.length > 0) || this.cpCount >= BUFFER_THRESHOLD) {
       this.lastEditAt = now;
       await this.edit(this.accumulated + CURSOR);
     }
@@ -178,6 +184,7 @@ export class StreamingRenderer {
       }
     }
     this.accumulated = "";
+    this.cpCount = 0;
     this.lastEditAt = 0;
     const msg = await this.bot.telegram.sendMessage(this.chatId, CURSOR);
     if (msg) this.msgId = msg.message_id;

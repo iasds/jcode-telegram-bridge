@@ -185,10 +185,19 @@ export function formatMessage(content: string): string {
   // 10) Escape remaining special characters
   text = escapeMdv2(text);
 
-  // 11) Restore placeholders in reverse insertion order (nested refs resolve).
-  for (const key of [...placeholders.keys()].reverse()) {
-    text = text.split(key).join(placeholders.get(key)!);
-  }
+  // 11) Restore placeholders in ONE pass over the text (P-05; was: a
+  // split/join scan of the full text per placeholder, O(n·p²)). Nested refs
+  // resolve depth-first inside the replacer, preserving the old
+  // reverse-insertion-order semantics. Work is linear in output size.
+  // A fresh /g regex per recursion level avoids lastIndex reentrancy.
+  const restorePlaceholders = (s: string): string =>
+    s.replace(/\u0000PH(\d+)\u0000/g, (tok, i: string) => {
+      const value = placeholders.get(`\u0000PH${i}\u0000`);
+      // Unknown index: leave the token verbatim (legacy split/join parity —
+      // only keys present in the map were ever replaced).
+      return value === undefined ? tok : restorePlaceholders(value);
+    });
+  text = restorePlaceholders(text);
 
   // 12) Safety net: escape bare ( ) { } outside code spans.
   const parts = text.split(/(```[\s\S]*?```|`[^`]+`)/g);

@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import type { JcodeClient } from "@1jehuang/jcode-sdk";
 import type { Config } from "./config.js";
+import { writeFileAtomic } from "./fsutil.js";
 
 export type ChatMode = "normal" | "plan";
 
@@ -161,9 +162,12 @@ export class SessionStore {
       this.saveTimer = null;
     }
     try {
-      writeFileSync(this.cfg.stateFile, JSON.stringify({ chats: this.chats }, null, 2), {
-        mode: 0o600,
-      });
+      // S-03/S-04: atomic durable write — a torn state.json means context amnesia.
+      writeFileAtomic(
+        this.cfg.stateFile,
+        JSON.stringify({ chats: this.chats }, null, 2),
+        0o600,
+      );
     } catch (err) {
       console.error("[sessions] persist failed:", err);
     }

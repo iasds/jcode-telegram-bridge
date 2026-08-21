@@ -17,6 +17,13 @@
 export interface TextBatchOptions {
   /** Longest quiet period before buffered text is flushed (ms). Default 1000. */
   maxWaitMs?: number;
+  /**
+   * Hard ceiling on a buffer's TOTAL age in ms (P-03-lite): when set, the
+   * buffer flushes once its oldest part reaches this age even if every
+   * incoming message keeps resetting the quiet-period timer (burst
+   * starvation guard). Default undefined = disabled (previous behavior).
+   */
+  hardCapMs?: number;
   /** Minimum previous-message length that makes the next message a chunk. Default 4000. */
   chunkLengthThreshold?: number;
   /** Joiner used to concatenate buffered parts. Default "\n". */
@@ -27,6 +34,8 @@ export interface TextBatchOptions {
    * setTimeout/clearTimeout.
    */
   schedule?: (fn: () => void, ms: number) => () => void;
+  /** Clock, injectable for deterministic tests. Default Date.now. */
+  now?: () => number;
 }
 
 export type FlushFn = (chatId: number, text: string) => void;
@@ -34,20 +43,26 @@ export type FlushFn = (chatId: number, text: string) => void;
 interface ChatBuffer {
   parts: string[];
   cancelTimer: (() => void) | null;
+  /** Timestamp (ms, from `now`) of the buffer's FIRST part; hard-cap anchor. */
+  firstPushAt?: number;
 }
 
 export class TextBatchAggregator {
   private readonly buffers = new Map<number, ChatBuffer>();
   private readonly maxWaitMs: number;
+  private readonly hardCapMs: number | undefined;
   private readonly join: string;
   private readonly schedule: (fn: () => void, ms: number) => () => void;
+  private readonly now: () => number;
 
   constructor(
     private readonly flushFn: FlushFn,
     opts: TextBatchOptions = {},
   ) {
     this.maxWaitMs = opts.maxWaitMs ?? 800;
+    this.hardCapMs = opts.hardCapMs;
     this.join = opts.join ?? "\n";
+    this.now = opts.now ?? Date.now;
     this.schedule =
       opts.schedule ??
       ((fn, ms) => {
@@ -63,6 +78,7 @@ export class TextBatchAggregator {
       buf = { parts: [], cancelTimer: null };
       this.buffers.set(chatId, buf);
     }
+    if (buf.parts.length === 0) buf.firstPushAt = this.now();
     buf.parts.push(text);
     this.resetTimer(chatId, buf);
   }
@@ -97,6 +113,13 @@ export class TextBatchAggregator {
       buf.cancelTimer = null;
       this.flushChat(chatId);
     }, this.maxWaitMs);
+    // P-03-lite: hard cap on TOTAL buffer age, immune to quiet-period
+    // resets. One timer per buffer, armed on the first part only; when it
+    // fires, the buffer is flushed even if the burst never quiets down.
+    if (this.hardCapMs !== undefined && buf.parts.length === 1) {
+      const remainingCap = this.hardCapMs - (this.now() - buf.firstPushAt!);
+      this.schedule(() => this.flush(chatId), Math.max(0, remainingCap));
+    }
   }
 
   private flushChat(chatId: number): void {

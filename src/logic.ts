@@ -26,7 +26,9 @@ export function advanceOffset(updates: { update_id: number }[], currentOffset: n
 export function parseOffset(raw: string | undefined): number {
   if (!raw) return 0;
   const n = Number(raw.trim());
-  return Number.isFinite(n) && n > 0 ? n : 0;
+  // S-04: isSafeInteger rejects non-integers/overflow; torn trailing digits
+  // can't be detected here — atomic writes (writeFileAtomic) close that hole.
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
 }
 
 /** True when the harness connection itself is dead (no point rotating a session). */

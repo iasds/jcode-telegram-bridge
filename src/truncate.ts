@@ -29,10 +29,20 @@ export function truncateMessage(content: string, maxLength = MAX_MESSAGE_LENGTH)
   if (content.length <= maxLength) return [content];
 
   const chunks: string[] = [];
-  let remaining = content;
+  // Index window into `content` (P-06: the old loop reassigned
+  // remaining = remaining.slice(splitAt), copying the rest of a potentially
+  // multi-hundred-KB string on every chunk, O(n²). We keep ONE reference to
+  // the original string and only ever slice small windows out of it.
+  let pos = 0; // absolute start offset of the not-yet-chunked text
+  let leadTrim = 0; // leading whitespace already stripped after last split
   let carryLang: string | null = null;
 
-  while (remaining) {
+  while (pos < content.length) {
+    // One-chunk working copy; O(maxLength), not O(remaining).
+    const remaining = content.slice(pos + leadTrim);
+    const base = pos + leadTrim; // absolute offset of remaining[0]
+    leadTrim = 0;
+
     // Reopen a code block carried from the previous chunk.
     const prefix = carryLang !== null ? `\`\`\`${carryLang}\n` : "";
 
@@ -116,9 +126,11 @@ export function truncateMessage(content: string, maxLength = MAX_MESSAGE_LENGTH)
     }
 
     chunks.push(fullChunk);
+    // Advance the window instead of reassigning the big string (P-06).
     // Strip leading whitespace left at the split boundary so the next chunk
     // does not start with it (hermes: remaining[split_at:].lstrip()).
-    remaining = remaining.slice(splitAt).replace(/^[ \t\n\r\f\v]+/, "");
+    pos = base + splitAt;
+    while (pos < content.length && /^[ \t\n\r\f\v]$/.test(content[pos]!)) pos++;
   }
 
   if (chunks.length > 1) {

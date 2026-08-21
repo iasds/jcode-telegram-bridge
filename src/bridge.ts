@@ -1,10 +1,11 @@
 import { JcodeClient, HarnessError } from "@1jehuang/jcode-sdk";
 import { Telegraf } from "telegraf";
 import https from "node:https";
-import { readFileSync, writeFileSync, readdirSync, statSync, unlinkSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, unlinkSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { loadConfig } from "./config.js";
+import { writeFileAtomic } from "./fsutil.js";
 import { enrichTextWithTranscript, transcribeAudio } from "./stt.js";
 import { SessionStore, QueueFullError } from "./sessions.js";
 import { TextBatchAggregator } from "./batch.js";
@@ -98,14 +99,36 @@ async function warmupStt(): Promise<void> {
   try {
     const model = cfg.stt.localModel || "small";
     const code = `from faster_whisper import WhisperModel; m=WhisperModel("${model}", device="cpu", compute_type="int8"); print("warmup ok")`;
-    await new Promise<void>((resolve) => {
+    // ST-01: verify the python process actually loaded the model — journal
+    // showed 53ms "warmup done" entries (instant exit, e.g. missing module).
+    // Require exit 0 AND the "warmup ok" stdout marker before declaring success.
+    const { code: exitCode, stdout, stderr } = await new Promise<{
+      code: number | null;
+      stdout: string;
+      stderr: string;
+    }>((resolve) => {
       const p = spawn("python3", ["-c", code], { timeout: 120_000 } as any);
-      let done = false;
-      const finish = () => { if (!done) { done = true; resolve(); } };
-      p.on("error", finish);
-      p.on("close", finish);
-      setTimeout(finish, 120_000);
+      let out = "";
+      let errOut = "";
+      let settled = false;
+      const finish = (code: number | null) => {
+        if (!settled) {
+          settled = true;
+          resolve({ code, stdout: out, stderr: errOut });
+        }
+      };
+      p.stdout!.on("data", (d) => (out += d));
+      p.stderr!.on("data", (d) => (errOut += d));
+      p.on("error", () => finish(-1));
+      p.on("close", (c) => finish(c));
+      setTimeout(() => finish(null), 120_000);
     });
+    if (exitCode !== 0 || !stdout.includes("warmup ok")) {
+      console.error(
+        `[stt] warmup FAILED after ${Date.now() - t0}ms: exit=${exitCode} stderr_tail=${stderr.slice(-200).replace(/\n/g, " ")}`,
+      );
+      return;
+    }
     console.log(`[stt] warmup ${model} done in ${Date.now() - t0}ms`);
   } catch (e) {
     console.warn(`[stt] warmup failed after ${Date.now() - t0}ms:`, e);
@@ -131,11 +154,58 @@ async function connectWithRetry(): Promise<JcodeClient> {
   throw lastErr;
 }
 
-const client = await connectWithRetry();
+// P-01 (boot unblock): don't top-level-await connectWithRetry — that left the
+// bot deaf for 0-30s at every boot while handlers/polling were already
+// registrable. Instead create a promise-gated proxy: handlers and pollLoop
+// start immediately; each first use of `client` awaits `clientReady`. On
+// failure the waiter gets a fatal error -> systemd restart (same semantics as
+// before), or replies "harness connecting" where a throw isn't handled.
+let client!: JcodeClient;
+let resolveClient!: (c: JcodeClient) => void;
+let rejectClient!: (e: unknown) => void;
+const clientReady = new Promise<JcodeClient>((res, rej) => {
+  resolveClient = res;
+  rejectClient = rej;
+});
+const connectPromise = connectWithRetry().then(
+  (c) => {
+    client = c;
+    resolveClient(c);
+    attachClientLifecycle(c);
+    return c;
+  },
+  (err) => {
+    rejectClient(err);
+    throw err;
+  },
+);
+connectPromise.catch((err) => {
+  console.error("[bridge] harness connect failed permanently:", err instanceof Error ? err.message : String(err));
+  process.exit(1);
+});
+/** Await the connected harness client; user-facing callers get a friendly message on timeout. */
+async function waitForClient(): Promise<JcodeClient> {
+  // The timeout promise must never dangle: clear its timer when the race
+  // settles and attach a no-op catch so a late rejection can't surface as an
+  // unhandledRejection (charter: zero unhandled rejections).
+  let cancelTimer: () => void = () => undefined;
+  const timeout = new Promise<never>((_, rej) => {
+    const t = setTimeout(() => rej(new Error("harness connecting, try again")), 15_000);
+    cancelTimer = () => clearTimeout(t);
+  });
+  timeout.catch(() => undefined); // handled-late no-op
+  try {
+    return await Promise.race([clientReady, timeout]);
+  } finally {
+    cancelTimer();
+  }
+}
+
 const store = new SessionStore(client, cfg);
 const renderer = new TurnRenderer({ disableLinkPreviews: cfg.disableLinkPreviews });
 
 const openModelPicker = async (chatId: number, replyTo?: number): Promise<void> => {
+  const c = await waitForClient();
   const st = await store.getOrCreate(chatId);
   await client.attachSession(st.sessionId);
   await sendModelPicker(bot, client, st.sessionId, chatId, replyTo);
@@ -149,7 +219,14 @@ function fatalExit(reason: string): never {
   console.error(`[bridge] fatal connection error (${reason}); exiting for systemd restart`);
   process.exit(1);
 }
-client.on("error", (err: unknown) => {
+
+let lastAttachSession: string | undefined;
+// P-01: lifecycle listeners must attach in the same tick the client is
+// created — any window where "close" fires unobserved would idle forever on a
+// dead socket. connectWithRetry().then() resolves on a later microtask, so
+// this runs synchronously inside it, before anything else can touch the client.
+function attachClientLifecycle(c: JcodeClient): void {
+c.on("error", (err: unknown) => {
   fatalExit(`transport error: ${err instanceof Error ? err.message : String(err)}`);
 });
 // The harness closes the socket cleanly when api-bridge exits (systemctl stop,
@@ -164,7 +241,6 @@ client.on("error", (err: unknown) => {
 // re-sent the same reply). So on close we drop the mapping for the last
 // attached session and persist synchronously before exiting; systemd brings
 // us back with a fresh connection and a fresh session.
-let lastAttachSession: string | undefined;
 // S-02: a poisoned-session close races in-flight turns. Exiting instantly
 // strands those turns on dead child sockets until their ~10min watchdog fires
 // (user sees silence). When turns are active we grant a short bounded grace so
@@ -172,7 +248,7 @@ let lastAttachSession: string | undefined;
 // for the systemd restart. Double-exit is impossible: fatalExit is
 // process.exit, and a re-entered grace clears any pending timer first.
 let closeGraceTimer: ReturnType<typeof setTimeout> | undefined;
-client.on("close", () => {
+c.on("close", () => {
   if (lastAttachSession) {
     for (const [chatId, st] of store.all()) {
       if (st.sessionId === lastAttachSession) {
@@ -198,6 +274,7 @@ client.on("close", () => {
   }
   fatalExit("harness connection closed");
 });
+}
 
 // In-flight turns per chat: /cancel aborts the controller and closes the
 // child connection so the events() loop unwinds promptly instead of waiting
@@ -220,7 +297,7 @@ const textBatcher = new TextBatchAggregator(
     const ctx = lastCtx.get(chatId);
     if (ctx) void route(ctx, text);
   },
-  { maxWaitMs: 800 },
+  { maxWaitMs: 800, hardCapMs: 10_000 },
 );
 // Persisted home channel (alongside state.json).
 const HOME_FILE = join(dirname(cfg.stateFile), "home.json");
@@ -235,7 +312,7 @@ function loadHome(): number | undefined {
 }
 function saveHome(chatId: number): void {
   try {
-    writeFileSync(HOME_FILE, JSON.stringify({ chatId }), { mode: 0o600 });
+    writeFileAtomic(HOME_FILE, JSON.stringify({ chatId }), 0o600);
   } catch (err) {
     console.error("[bridge] save home failed:", err);
   }
@@ -576,6 +653,15 @@ async function route(ctx: any, text: string): Promise<void> {
   void store.enqueue(
     chatId,
       async () => {
+        // P-01: first harness use in a turn waits for the lazy connect; if
+        // it's still not up after 15s tell the user instead of hanging silently.
+        try {
+          await waitForClient();
+        } catch (err) {
+          throw new Error(
+            `harness connecting, try again (${err instanceof Error ? err.message : String(err)})`,
+          );
+        }
         // -- session lookup + attach (serialized per chat) -----------------
         let st = await withHarnessRetry("getOrCreate", () => store.getOrCreate(chatId));
         try {
@@ -764,7 +850,10 @@ async function route(ctx: any, text: string): Promise<void> {
 }
 
 console.log(`[bridge] started. bot=${cfg.botToken.split(":")[0]} allowed=${cfg.allowedIds.length ? cfg.allowedIds.join(",") : "(all)"} workdir=${cfg.workDir}`);
-pruneVoiceDurables();
+// P-02: the sync pre-poll prune blocked boot 0.2-2s at 28K durables. Defer it
+// 30s past startup and repeat hourly; unref so it never holds the process open.
+setTimeout(() => pruneVoiceDurables(), 30_000).unref();
+setInterval(() => pruneVoiceDurables(), 3600_000).unref();
 void warmupStt();
 
 bot.catch((err, ctx) => {
@@ -821,7 +910,9 @@ function loadOffset(): number {
 }
 function saveOffset(offset: number): void {
   try {
-    writeFileSync(cfg.offsetFile, String(offset), { mode: 0o600 });
+    // S-03/S-04: atomic durable write — a torn offset (e.g. '90627521' from
+    // '906275210') replays ALL updates after restart; tmp+fsync+rename can't tear.
+    writeFileAtomic(cfg.offsetFile, String(offset), 0o600);
   } catch (err) {
     console.error("[bridge] save offset failed:", err);
   }

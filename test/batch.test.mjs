@@ -175,3 +175,96 @@ test("isLikelyTextChunk: custom threshold", () => {
   assert.equal(isLikelyTextChunk("x".repeat(99), "y", 100), false);
   assert.equal(isLikelyTextChunk("x".repeat(10), "y", 0), true, "threshold 0 means every previous message qualifies");
 });
+
+// ── P-03-lite: hardCapMs starvation guard ──────────────────────────────────
+
+/** Manual-clock scheduler harness for deterministic timer tests. */
+function makeClockScheduler(nowFn) {
+  const timers = [];
+  let seq = 0;
+  return {
+    timers,
+    schedule(fn, ms) {
+      const id = ++seq;
+      timers.push({ id, at: nowFn() + ms, fn, cancelled: false });
+      return () => {
+        const t = timers.find((x) => x.id === id);
+        if (t) t.cancelled = true;
+      };
+    },
+    fireDue() {
+      const due = timers.filter((t) => !t.cancelled && t.at <= nowFn());
+      for (const t of due) {
+        t.cancelled = true;
+        t.fn();
+      }
+      return due.length;
+    },
+  };
+}
+
+test("hardCapMs: quiet-reset starvation still flushes at the hard cap", () => {
+  let clock = 0;
+  const sched = makeClockScheduler(() => clock);
+  const calls = [];
+  const agg = new TextBatchAggregator(
+    (chatId, text) => calls.push({ chatId, text }),
+    { maxWaitMs: 50, hardCapMs: 120, schedule: sched.schedule, now: () => clock },
+  );
+
+  agg.push(1, "m1"); // quiet timer @50, hard-cap timer @120
+  clock = 40;
+  agg.push(1, "m2"); // resets quiet window (@90); cap untouched
+  assert.equal(sched.fireDue(), 0, "nothing due at t=40");
+  clock = 80;
+  agg.push(1, "m3"); // resets quiet window again (@130) — classic starvation
+  assert.equal(sched.fireDue(), 0, "quiet flush must stay suppressed by resets");
+
+  clock = 120; // total buffer age reaches hardCapMs
+  const fired = sched.fireDue();
+  assert.equal(fired, 1, "exactly the hard-cap timer fires");
+  assert.deepEqual(calls, [{ chatId: 1, text: "m1\nm2\nm3" }]);
+  assert.equal(agg.pendingCount(), 0);
+
+  clock = 500;
+  sched.fireDue(); // stale quiet timer was cancelled by the flush
+  assert.equal(calls.length, 1, "no duplicate flush afterwards");
+});
+
+test("hardCapMs: unset (default) preserves quiet-period-only behavior", () => {
+  let clock = 0;
+  const sched = makeClockScheduler(() => clock);
+  const calls = [];
+  const agg = new TextBatchAggregator(
+    (chatId, text) => calls.push({ chatId, text }),
+    { maxWaitMs: 50, schedule: sched.schedule }, // no hardCapMs
+  );
+
+  // Burst of resets while timers keep being cancelled before firing...
+  clock = 0; agg.push(1, "m0");
+  clock = 40; agg.push(1, "m40"); assert.equal(sched.fireDue(), 0);
+  clock = 80; agg.push(1, "m80"); assert.equal(sched.fireDue(), 0);
+  clock = 120; agg.push(1, "m120"); assert.equal(sched.fireDue(), 0);
+  // ...then the burst STOPS. No cap timer exists, so nothing fires until
+  // the final quiet window (t=170) elapses.
+  clock = 100; assert.equal(sched.fireDue(), 0);
+  clock = 169; assert.equal(sched.fireDue(), 0);
+  clock = 170; assert.equal(sched.fireDue(), 1);
+  assert.deepEqual(calls, [{ chatId: 1, text: "m0\nm40\nm80\nm120" }]);
+});
+
+test("hardCapMs: real-timer smoke test — starving burst flushes by the cap", async () => {
+  const calls = [];
+  const agg = new TextBatchAggregator((chatId, text) => calls.push({ chatId, text }), {
+    maxWaitMs: 25,
+    hardCapMs: 60,
+  });
+  agg.push(3, "a");
+  await new Promise((r) => setTimeout(r, 15));
+  agg.push(3, "b"); // reset #1
+  await new Promise((r) => setTimeout(r, 15));
+  agg.push(3, "c"); // reset #2 — past this point age > 60ms soon
+  await new Promise((r) => setTimeout(r, 45));
+  assert.deepEqual(calls, [{ chatId: 3, text: "a\nb\nc" }], "hard cap flushed the starved buffer");
+  assert.equal(agg.pendingCount(), 0);
+});

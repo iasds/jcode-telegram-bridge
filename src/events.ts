@@ -17,6 +17,11 @@ export interface RendererOptions {
 }
 
 const MAX_RETRIES = 3;
+// M-01a: bound the per-renderer chatId->Context cache. Insertion-order
+// eviction (Map preserves insertion order) keeps memory bounded without an
+// LRU dependency. Note re-inserting an existing key does NOT renew its
+// position; entries evict in first-inserted order.
+const CTX_CACHE_CAP = 64;
 
 function retryAfterMs(err: unknown): number | undefined {
   const e = err as {
@@ -34,6 +39,12 @@ export class TurnRenderer {
   constructor(private opts: RendererOptions = {}) {}
 
   cacheContext(chatId: number, ctx: Context): void {
+    // M-01a: at cap, drop the OLDEST key before inserting a new one
+    // (Map preserves insertion order; keys()[0] is the oldest).
+    if (!this.ctxCache.has(chatId) && this.ctxCache.size >= CTX_CACHE_CAP) {
+      const oldest = this.ctxCache.keys().next().value;
+      if (oldest !== undefined) this.ctxCache.delete(oldest);
+    }
     this.ctxCache.set(chatId, ctx);
   }
 

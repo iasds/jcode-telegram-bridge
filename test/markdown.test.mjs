@@ -84,3 +84,47 @@ test("nested parens in link URL survive", () => {
   const out = formatMessage("[a](https://x.com/p/(1)/q)");
   assert.equal(out, "[a](https://x.com/p/\\(1\\)/q)");
 });
+
+// ── P-05: single-pass placeholder restore ─────────────────────────────────
+
+test("P-05: interleaved placeholders restore exactly (header/bold/code/link/strike)", () => {
+  const out = formatMessage(
+    "## 标题\n**粗体** 和 `代码` 以及 [链接](https://e.com/a_(b)) 和 ~~删除~~",
+  );
+  assert.equal(
+    out,
+    "*标题*\n*粗体* 和 `代码` 以及 [链接](https://e.com/a_\\(b\\)) 和 ~删除~",
+  );
+});
+
+test("P-05: nested placeholder inside a placeholder value resolves depth-first", () => {
+  // `code` becomes PH0 first; the bold span then becomes PH1 whose VALUE
+  // contains the PH0 token. Restore must recurse: PH1 -> *a PH0 b* -> *a `code` b*.
+  const out = formatMessage("**a `code` b**");
+  assert.equal(out, "*a `code` b*");
+});
+
+test("P-05: multiple distinct indices inside one value all resolve", () => {
+  const out = formatMessage("**x `c1` y `c2` z**");
+  assert.equal(out, "*x `c1` y `c2` z*");
+});
+
+test("P-05: foreign placeholder-looking tokens are left verbatim (no crash)", () => {
+  const input = "before\u0000PH999\u0000after";
+  assert.equal(formatMessage(input), input);
+});
+
+test("P-05: many protected spans over a large document stay verbatim and fast", () => {
+  const parts = [];
+  for (let i = 0; i < 400; i++) parts.push(`para ${i} with \`code_${i}\` and **b${i}**`);
+  const input = parts.join("\n\n");
+  const t0 = process.hrtime.bigint();
+  const out = formatMessage(input);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.ok(ms < 2000, `formatMessage took ${ms}ms`);
+  for (let i = 0; i < 400; i += 97) {
+    assert.ok(out.includes(`\`code_${i}\``), `span ${i} missing`);
+    assert.ok(out.includes(`*b${i}*`), `bold ${i} missing`);
+  }
+  assert.ok(!out.includes("\u0000"), "no placeholder leaked into output");
+});
