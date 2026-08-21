@@ -96,3 +96,61 @@ test("enqueue: previous failure does not block the next task", async () => {
   });
   assert.equal(ran, true);
 });
+
+test("getOrCreateSafe: concurrent calls on unmapped chat create exactly ONE session", async () => {
+  let createCalls = 0;
+  const countingClient = {
+    createSession: async () => {
+      createCalls++;
+      // Simulate daemon latency so concurrent callers overlap.
+      await new Promise((r) => setTimeout(r, 10));
+      return { session_id: `session_${createCalls}` };
+    },
+  };
+  const store = new SessionStore(countingClient, cfg);
+
+  // Fire N concurrent Safe lookups on an unmapped chat, like two rapid commands.
+  const results = await Promise.all(
+    Array.from({ length: 8 }, () => store.getOrCreateSafe(42)),
+  );
+
+  assert.equal(createCalls, 1, "daemon createSession must be called exactly once");
+  const ids = new Set(results.map((st) => st.sessionId));
+  assert.equal(ids.size, 1, "all callers must observe the same session");
+});
+
+test("getOrCreateSafe: serializes with route()'s queue work on the same chat", async () => {
+  let createCalls = 0;
+  const countingClient = {
+    createSession: async () => {
+      createCalls++;
+      await new Promise((r) => setTimeout(r, 5));
+      return { session_id: `session_${createCalls}` };
+    },
+  };
+  const store = new SessionStore(countingClient, cfg);
+
+  // Seed a stale mapping so the test can distinguish serialized from
+  // non-serialized execution: a broken (non-queued) Safe lookup would
+  // observe the seeded mapping and return "session_stale" with 0 creates,
+  // while a correctly serialized one waits behind the turn's removal and
+  // must create fresh.
+  store.set(7, {
+    sessionId: "session_stale",
+    mode: "normal",
+    workdir: cfg.workDir,
+    createdAt: Date.now(),
+  });
+
+  // Interleave a long queue turn (route()-style) with a Safe lookup.
+  const turn = store.enqueue(7, async () => {
+    await new Promise((r) => setTimeout(r, 20));
+    store.remove(7); // rotate-style removal mid-turn
+  });
+  const safe = store.getOrCreateSafe(7).then((st) => st.sessionId);
+  const [, sessionId] = await Promise.all([turn, safe]);
+  // The Safe lookup ran strictly after the turn removed the mapping,
+  // so it created a fresh session instead of observing the stale one.
+  assert.equal(createCalls, 1);
+  assert.match(sessionId, /^session_1$/);
+});

@@ -165,6 +165,13 @@ client.on("error", (err: unknown) => {
 // attached session and persist synchronously before exiting; systemd brings
 // us back with a fresh connection and a fresh session.
 let lastAttachSession: string | undefined;
+// S-02: a poisoned-session close races in-flight turns. Exiting instantly
+// strands those turns on dead child sockets until their ~10min watchdog fires
+// (user sees silence). When turns are active we grant a short bounded grace so
+// their fast-fail paths run (children share the closed transport), then exit
+// for the systemd restart. Double-exit is impossible: fatalExit is
+// process.exit, and a re-entered grace clears any pending timer first.
+let closeGraceTimer: ReturnType<typeof setTimeout> | undefined;
 client.on("close", () => {
   if (lastAttachSession) {
     for (const [chatId, st] of store.all()) {
@@ -177,6 +184,17 @@ client.on("close", () => {
     }
     store.persistNow();
     lastAttachSession = undefined;
+  }
+  if (activeTurns.size > 0) {
+    console.warn(
+      `[bridge] connection closed with ${activeTurns.size} active turn(s); granting 5s grace before exit`,
+    );
+    if (closeGraceTimer) clearTimeout(closeGraceTimer);
+    closeGraceTimer = setTimeout(
+      () => fatalExit("harness connection closed (5s turn grace elapsed)"),
+      5_000,
+    );
+    return;
   }
   fatalExit("harness connection closed");
 });
@@ -283,6 +301,9 @@ bot.help(async (ctx) => {
 });
 
 bot.on("callback_query", (ctx) => {
+  // SEC-01: picker buttons reach client.setModel — they must not be pressable
+  // by arbitrary group members.
+  if (!allowed(ctx.from?.id)) return;
   void handleModelPickerCallback(bot, client, ctx).catch((err) => {
     console.error("[bridge] callback error:", err);
   });
@@ -292,12 +313,14 @@ bot.on("text", async (ctx) => {
   const chat = ctx.chat;
   const fromId = ctx.from?.id;
   if (!chat || !fromId) return;
-  renderer.cacheContext(chat.id, ctx);
-  lastCtx.set(chat.id, ctx);
+  // SEC-02: cache writes happen only AFTER the auth gate — unauthenticated
+  // messages must never grow renderer/lastCtx caches (unbounded pre-auth maps).
   if (!allowed(fromId)) {
     console.log(`[bridge] ignored message from non-allowed user ${fromId}`);
     return;
   }
+  renderer.cacheContext(chat.id, ctx);
+  lastCtx.set(chat.id, ctx);
   if (cfg.chatOnly && chat.type !== "private") {
     console.log(`[bridge] ignored ${chat.type} message (chat-only mode) from ${fromId}`);
     return;
@@ -866,13 +889,18 @@ async function pollLoop(bot: Telegraf): Promise<void> {
       continue;
     }
     if (updates.length > 0) {
+      // S-00: advance the offset immediately, but persist it only AFTER the
+      // handleUpdate batch resolves. Persisting first meant a crash between
+      // save and handling permanently dropped confirmed-but-unprocessed
+      // updates (silent loss). At-least-once beats at-most-once: worst case
+      // after a mid-batch crash is a rare duplicate reply, never lost updates.
       offset = advanceOffset(updates, offset);
-      saveOffset(offset);
       await Promise.all(
         updates.map((u) => bot.handleUpdate(u as never).catch((e: unknown) => {
           console.error("[bridge] handleUpdate error:", e);
         })),
       );
+      saveOffset(offset);
     }
   }
 }

@@ -47,8 +47,34 @@ export class SessionStore {
     }
   }
 
-  /** Get existing session for a chat, or create one. */
-  async getOrCreate(chatId: number): Promise<ChatState> {
+  /**
+   * Get existing session for a chat, or create one.
+   *
+   * NOT serialized on its own: callers outside route()'s per-chat queue
+   * MUST use {@link getOrCreateSafe} instead. This alias exists for
+   * callers already running INSIDE that queue (e.g. bridge route() /
+   * turn callbacks): nesting another enqueue on the same chatId here
+   * would deadlock via tail-chaining (the inner enqueue's task waits for
+   * the outer one to finish).
+   */
+  getOrCreate(chatId: number): Promise<ChatState> {
+    return this.getOrCreateRaw(chatId);
+  }
+
+  /**
+   * Serialized variant of {@link getOrCreate}: runs check-create-check
+   * atomically inside the per-chat queue. Out-of-queue callers
+   * (commands.ts handlers like /info /plan /model /title /resume
+   * /background, model picker, etc.) MUST use this so two rapid commands
+   * on an unmapped chat cannot create two daemon sessions or race with
+   * route()'s remove->rotate logic.
+   */
+  getOrCreateSafe(chatId: number): Promise<ChatState> {
+    return this.enqueue(chatId, () => this.getOrCreateRaw(chatId));
+  }
+
+  /** Raw check-create-check body. Only call from inside the per-chat queue. */
+  private async getOrCreateRaw(chatId: number): Promise<ChatState> {
     const key = String(chatId);
     const existing = this.chats[key];
     if (existing) return existing;

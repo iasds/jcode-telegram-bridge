@@ -106,7 +106,7 @@ export async function handleCommand(
     }
 
     case "info": {
-      const st = await store.getOrCreate(chatId);
+      const st = await store.getOrCreateSafe(chatId);
       try {
         await client.attachSession(st.sessionId);
         const rt = await client.getRuntimeInfo(st.sessionId);
@@ -136,7 +136,7 @@ export async function handleCommand(
     }
 
     case "plan": {
-      const st = await store.getOrCreate(chatId);
+      const st = await store.getOrCreateSafe(chatId);
       const next = st.mode === "plan" ? "normal" : "plan";
       store.set(chatId, { ...st, mode: next });
       await reply(
@@ -148,7 +148,7 @@ export async function handleCommand(
     }
 
     case "model": {
-      const st = await store.getOrCreate(chatId);
+      const st = await store.getOrCreateSafe(chatId);
       try {
         await client.attachSession(st.sessionId);
         const catalog = await client.listModels(st.sessionId);
@@ -229,7 +229,7 @@ export async function handleCommand(
     }
 
     case "title": {
-      const st = await store.getOrCreate(chatId);
+      const st = await store.getOrCreateSafe(chatId);
       try {
         await client.attachSession(st.sessionId);
         if (!arg) {
@@ -266,7 +266,7 @@ export async function handleCommand(
         await reply("Usage: /resume <session-id> (see /sessions).");
         return true;
       }
-      const st = await store.getOrCreate(chatId);
+      const st = await store.getOrCreateSafe(chatId);
       store.set(chatId, { ...st, sessionId: arg });
       await reply(`✅ Switched this chat to session \`${escapeMdv2(arg)}\`.`);
       return true;
@@ -307,7 +307,7 @@ export async function handleCommand(
         await reply("Usage: /background <prompt> — run in a separate background session.");
         return true;
       }
-      const st = await store.getOrCreate(chatId);
+      const st = await store.getOrCreateSafe(chatId);
       try {
         await client.attachSession(st.sessionId);
         const bg = await client.createSession(st.workdir);
