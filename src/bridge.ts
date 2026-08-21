@@ -312,7 +312,7 @@ function cappedSet<V>(map: Map<number, V>, key: number, value: V, cap = CACHE_CA
 const textBatcher = new TextBatchAggregator(
   (chatId, text) => {
     const ctx = lastCtx.get(chatId);
-    if (ctx) void route(ctx, text);
+    if (ctx) void route(ctx, text).catch(routeCatchLog);
   },
   { maxWaitMs: 800, hardCapMs: 10_000 },
 );
@@ -343,7 +343,10 @@ const hooks: BridgeHooks = {
   lastUserText: (chatId) => lastUserTexts.get(chatId),
   retryLast: (chatId) => {
     const last = lastUserTexts.get(chatId);
-    if (last) void route({ chat: { id: chatId }, message: { message_id: undefined } } as never, last);
+    if (last)
+      void route({ chat: { id: chatId }, message: { message_id: undefined } } as never, last).catch(
+        routeCatchLog,
+      );
   },
   homeChat: {
     set: (chatId) => {
@@ -423,7 +426,7 @@ bot.on("text", async (ctx) => {
   // plain text is quiet-period batched so >4096 splits arrive as one turn.
   const deliver = (text: string) => {
     if (text.trim().startsWith("/")) {
-      void route(ctx, text);
+      void route(ctx, text).catch(routeCatchLog);
     } else {
       textBatcher.push(chat.id, text);
     }
@@ -662,6 +665,16 @@ bot.on("location", (ctx) => {
   if (!allowed(ctx.from?.id)) return;
   mediaDeliver(chatId, ctx, "📍 [location]");
 });
+
+// Fire-and-forget route() callers must still observe rejections (charter:
+// zero unhandled rejections). handleCommand/turn errors that escape the
+// queue-level catch land here, logged with context.
+function routeCatchLog(err: unknown): void {
+  console.error(
+    "[route] unhandled route failure:",
+    err instanceof Error ? err.message : String(err),
+  );
+}
 
 async function route(ctx: any, text: string): Promise<void> {
   const chatId: number = ctx.chat.id;
