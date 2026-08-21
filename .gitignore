@@ -5,3 +5,4 @@ state.json
 
 # runtime state (never commit)
 poll-offset.txt
+ops/journal-errors-24h.txt
