@@ -16,7 +16,7 @@ Deadline arithmetic (UTC): T0=2026-08-21T11:43:30Z → fix-freeze T+2:20=14:03:3
 - Red gate = send back to same worker for rework, unlimited rounds.
 - Green gate = coordinator commits serially: `optimize(<lane>): <summary>`.
 - Cross review: one idle agent adversarially reviews each batch before commit; objections → rework.
-- RED LINES: never touch `.env`, never commit tokens/secrets/proxy node names (日本JP-HY2/mihomo etc),
+- RED LINES: never touch `.env`, never commit tokens/secrets/proxy node names,
   no push until final unified push at T+2:50.
 - Live services must stay up: test against dist build only after unit tests; restarts allowed (bot reconnects).
 

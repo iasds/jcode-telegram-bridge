@@ -81,10 +81,10 @@ print(json.dumps(res, ensure_ascii=False))
   const env: NodeJS.ProcessEnv = { ...process.env };
   // Force zh for hermes language resolution (hermes default is en)
   if (!env.HERMES_LOCAL_STT_LANGUAGE && scfg.language) env.HERMES_LOCAL_STT_LANGUAGE = scfg.language;
-  // Do NOT force HF_ENDPOINT/HF_HUB_DISABLE_XET: the host is behind
-  // sys-mihomo transparent proxy (hermes-agent netvm=sys-mihomo, SELECT=JP-HY2
-  // gives ~7MB/s to us.aws.cdn.hf.co via XET). Forcing hf-mirror or disabling
-  // XET regresses to TLS EOF / 200KB/s. Respect whatever the operator set.
+  // Do NOT force HF_ENDPOINT/HF_HUB_DISABLE_XET: this host reaches
+  // huggingface.co through a transparent proxy whose CDN route is fast,
+  // while hf-mirror / non-XET paths regress to TLS EOF or ~200KB/s here.
+  // Respect whatever the operator configured; no endpoint overrides.
   env.PYTHONPATH = [hermesAgentDir(), env.PYTHONPATH ?? ""].filter(Boolean).join(":");
 
   const model = scfg.localModel || "small";
