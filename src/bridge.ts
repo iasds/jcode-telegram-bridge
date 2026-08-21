@@ -6,7 +6,7 @@ import { join, dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { loadConfig } from "./config.js";
 import { writeFileAtomic } from "./fsutil.js";
-import { enrichTextWithTranscript, transcribeAudio } from "./stt.js";
+import { enrichTextWithTranscript, transcribeAudio, warmupResident } from "./stt.js";
 import { SessionStore, QueueFullError } from "./sessions.js";
 import { TextBatchAggregator } from "./batch.js";
 import { TurnRenderer } from "./events.js";
@@ -96,40 +96,20 @@ function pruneVoiceDurables(): void {
 async function warmupStt(): Promise<void> {
   if (!cfg.stt.enabled) return;
   const t0 = Date.now();
+  // B-01: warm the RESIDENT worker (model stays loaded in stt_worker.py), so
+  // the first real voice note skips both spawn and model load. The old
+  // throwaway-process preload only warmed the OS page cache; the resident
+  // worker makes the warmup actually bind to the serving path. If resident
+  // startup fails, transcribeAudio still falls back to spawn-per-request.
   try {
-    const model = cfg.stt.localModel || "small";
-    const code = `from faster_whisper import WhisperModel; m=WhisperModel("${model}", device="cpu", compute_type="int8"); print("warmup ok")`;
-    // ST-01: verify the python process actually loaded the model — journal
-    // showed 53ms "warmup done" entries (instant exit, e.g. missing module).
-    // Require exit 0 AND the "warmup ok" stdout marker before declaring success.
-    const { code: exitCode, stdout, stderr } = await new Promise<{
-      code: number | null;
-      stdout: string;
-      stderr: string;
-    }>((resolve) => {
-      const p = spawn("python3", ["-c", code], { timeout: 120_000 } as any);
-      let out = "";
-      let errOut = "";
-      let settled = false;
-      const finish = (code: number | null) => {
-        if (!settled) {
-          settled = true;
-          resolve({ code, stdout: out, stderr: errOut });
-        }
-      };
-      p.stdout!.on("data", (d) => (out += d));
-      p.stderr!.on("data", (d) => (errOut += d));
-      p.on("error", () => finish(-1));
-      p.on("close", (c) => finish(c));
-      setTimeout(() => finish(null), 120_000);
-    });
-    if (exitCode !== 0 || !stdout.includes("warmup ok")) {
+    const ok = await warmupResident();
+    if (ok) {
+      console.log(`[stt] resident worker warm in ${Date.now() - t0}ms`);
+    } else {
       console.error(
-        `[stt] warmup FAILED after ${Date.now() - t0}ms: exit=${exitCode} stderr_tail=${stderr.slice(-200).replace(/\n/g, " ")}`,
+        `[stt] resident warmup FAILED after ${Date.now() - t0}ms (see [stt] logs above); will fall back to per-request python`,
       );
-      return;
     }
-    console.log(`[stt] warmup ${model} done in ${Date.now() - t0}ms`);
   } catch (e) {
     console.warn(`[stt] warmup failed after ${Date.now() - t0}ms:`, e);
   }

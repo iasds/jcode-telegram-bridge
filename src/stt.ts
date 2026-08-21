@@ -1,14 +1,18 @@
 /**
- * STT — thin Node wrapper around hermes-agent/tools/transcription_tools.py
+ * STT — local speech-to-text via hermes-agent transcription tools.
  *
- * Does NOT re-implement Whisper/VAD/hallucination logic. Delegates to
- * `transcribe_audio(path, model="small", source="gateway")` so local VAD,
- * no_speech/logprob gates, CUDA fallback, .silk handling, and cloud trim stay
- * 1:1 with hermes-agent.
+ * Primary path (B-01): a RESIDENT python worker (`stt_worker.py`, JSON lines
+ * over stdin/stdout) keeps the faster-whisper model loaded across requests,
+ * eliminating the 1.2-3s/request python spawn+import+model-load overhead.
+ * The old spawn-per-request inline path is kept verbatim as a fallback so
+ * STT never regresses if the worker cannot run. Both paths delegate real
+ * Whisper/VAD/hallucination logic to hermes-agent's transcription_tools
+ * (1:1 with hermes-agent behavior; see stt_worker.py for the parity notes).
  *
  * Required at runtime: checkout at ~/.jcode/scratch/hermes-agent (or set
- * HERMES_AGENT_DIR), plus faster-whisper + ffmpeg. Env HERMES_LOCAL_STT_LANGUAGE
- * and model="small" give zh/small defaults (hermes defaults are en/base).
+ * HERMES_AGENT_DIR), plus faster-whisper + ffmpeg, and stt_worker.py next to
+ * the compiled dist/ (repo root). Env HERMES_LOCAL_STT_LANGUAGE and
+ * model="small" give zh/small defaults (hermes defaults are en/base).
  */
 import { existsSync, statSync, readFileSync } from "node:fs";
 import { extname, resolve } from "node:path";
@@ -19,6 +23,14 @@ export const SUPPORTED_FORMATS = new Set([
   ".ogg", ".oga", ".opus", ".aac", ".flac", ".caf", ".silk",
 ]);
 export const STT_MAX_FILE_BYTES = 25 * 1024 * 1024;
+
+// Resident-worker policy (B-01). Per-job budget matches the old inline spawn
+// timeout (180s); a job that misses it rejects the caller but leaves the
+// worker running unless a second concurrent timeout fires during the wedge
+// grace window, which proves the process is wedged and forces kill+respawn.
+export const STT_JOB_TIMEOUT_MS = 120_000;
+const STT_INLINE_FALLBACK_TIMEOUT_MS = 180_000;
+const STT_WORKER_WEDGE_GRACE_MS = 30_000;
 
 export interface TranscriptionResult {
   success: boolean;
@@ -89,8 +101,16 @@ print(json.dumps(res, ensure_ascii=False))
 
   const model = scfg.localModel || "small";
 
+  // Resident-worker fast path; spawn-per-request below stays as the
+  // never-regress fallback when the worker cannot be spawned/used.
+  try {
+    return await transcribeViaResident(abs, scfg);
+  } catch (e) {
+    console.error(`[stt] resident worker unavailable, falling back to inline python: ${e instanceof Error ? e.message : e}`);
+    resetSttWorker();
+  }
   return await new Promise<TranscriptionResult>((resolveR) => {
-    const p = spawn("python3", ["-c", code, abs, model], { env, timeout: 180_000 } as any);
+    const p = spawn("python3", ["-c", code, abs, model], { env, timeout: STT_INLINE_FALLBACK_TIMEOUT_MS } as any);
     let out = "";
     let err = "";
     p.stdout?.on("data", (d: Buffer) => (out += d.toString()));
@@ -149,4 +169,173 @@ export function enrichTextWithTranscript(userText: string, transcripts: string[]
   if (!userText || userText.trim() === placeholder) return prefix;
   if (userText) return `${prefix}\n\n${userText}`;
   return prefix;
+}
+
+// ---------------------------------------------------------------------------
+// Resident STT worker (B-01): one long-lived python process keeps the
+// faster-whisper model loaded, eliminating the 1.2-3s/request spawn+import+
+// model-load overhead of the inline path above. Protocol: JSON lines both
+// ways. Jobs: {"id","path"} transcribe | {"id","op":"load"} preload |
+// {"id","op":"ping"}. Replies: {"id","ok",...}. The worker never exits on job
+// errors; if the PROCESS dies we reject pendings and self-heal on next use.
+// ---------------------------------------------------------------------------
+
+interface ResidentReply {
+  id: string;
+  ok: boolean;
+  transcript?: string;
+  error?: string;
+  provider?: string;
+}
+
+interface PendingJob {
+  timer: NodeJS.Timeout;
+  resolve: (r: TranscriptionResult) => void;
+}
+
+interface SttWorker {
+  child: ReturnType<typeof spawn>;
+  pending: Map<string, PendingJob>;
+  wedgedTimer?: NodeJS.Timeout;
+}
+
+let sttWorkerSingleton: SttWorker | null = null;
+
+export function resetSttWorker(): void {
+  const w = sttWorkerSingleton;
+  sttWorkerSingleton = null;
+  if (!w) return;
+  if (w.wedgedTimer) clearTimeout(w.wedgedTimer);
+  for (const [, p] of w.pending) {
+    clearTimeout(p.timer);
+    p.resolve({ success: false, transcript: "", provider: "local", error: "STT resident worker is shutting down" });
+  }
+  w.pending.clear();
+  try {
+    w.child.kill("SIGTERM"); // python handler finishes current line then exits 0
+  } catch {}
+}
+
+function failAllPending(w: SttWorker, why: string): void {
+  if (w.wedgedTimer) {
+    clearTimeout(w.wedgedTimer);
+    w.wedgedTimer = undefined;
+  }
+  for (const [, p] of w.pending) {
+    clearTimeout(p.timer);
+    p.resolve({ success: false, transcript: "", provider: "local", error: why });
+  }
+  w.pending.clear();
+}
+
+function wireWorker(w: SttWorker): void {
+  let buf = "";
+  w.child.stdout?.setEncoding("utf8");
+  w.child.stdout?.on("data", (chunk: string) => {
+    buf += chunk;
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      let reply: ResidentReply;
+      try {
+        reply = JSON.parse(line);
+      } catch {
+        continue; // not protocol output; ignore
+      }
+      const p = w.pending.get(reply.id);
+      if (!p) continue;
+      w.pending.delete(reply.id);
+      clearTimeout(p.timer);
+      if (reply.ok) p.resolve({ success: true, transcript: String(reply.transcript ?? ""), provider: String(reply.provider ?? "local") });
+      else p.resolve({ success: false, transcript: "", provider: String(reply.provider ?? "local"), error: reply.error ? String(reply.error).slice(0, 800) : "worker reported failure" });
+    }
+  });
+  const died = (why: string) => {
+    if (sttWorkerSingleton === w) sttWorkerSingleton = null; // self-heal: next request respawns
+    failAllPending(w, why);
+  };
+  w.child.on("error", (e) => died(`STT resident worker failed (${e.message})`));
+  w.child.on("close", (code, signal) => died(`STT resident worker exited unexpectedly (code=${code}${signal ? ` signal=${signal}` : ""})`));
+}
+
+function getSttWorker(scfg: SttConfig): SttWorker {
+  if (sttWorkerSingleton) return sttWorkerSingleton;
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (!env.HERMES_LOCAL_STT_LANGUAGE && scfg.language) env.HERMES_LOCAL_STT_LANGUAGE = scfg.language;
+  env.PYTHONPATH = [hermesAgentDir(), env.PYTHONPATH ?? ""].filter(Boolean).join(":");
+  const script = resolve(process.cwd(), "stt_worker.py");
+  const child = spawn("python3", [script, scfg.localModel || "small"], {
+    env,
+    stdio: ["pipe", "pipe", "inherit"], // worker diagnostics flow to our stderr
+  });
+  child.unref?.();
+  const w: SttWorker = { child, pending: new Map() };
+  sttWorkerSingleton = w;
+  wireWorker(w);
+  return w;
+}
+
+function sendJob(w: SttWorker, job: Record<string, unknown>, timeoutMs: number): Promise<TranscriptionResult> {
+  return new Promise<TranscriptionResult>((resolveP, rejectP) => {
+    const id = String(job.id);
+    const timer = setTimeout(() => {
+      if (!w.pending.delete(id)) return;
+      if (w.pending.size === 0) {
+        // Worker processed nothing else and missed our deadline: likely wedged
+        // (e.g. blocked in a C call). Arm a short fuse; a second concurrent
+        // timeout before it fires proves the wedge and forces kill+respawn.
+        w.wedgedTimer = setTimeout(() => {
+          try {
+            w.child.kill("SIGKILL");
+          } catch {}
+        }, STT_WORKER_WEDGE_GRACE_MS);
+        w.wedgedTimer.unref?.();
+      }
+      rejectP(new Error(`STT resident worker timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
+    timer.unref?.();
+    w.pending.set(id, { timer, resolve: resolveP as (r: TranscriptionResult) => void });
+    try {
+      const stdin = w.child.stdin;
+      if (!stdin) throw new Error("STT resident worker has no stdin pipe");
+      stdin.write(JSON.stringify(job) + "\n");
+    } catch (e) {
+      w.pending.delete(id);
+      clearTimeout(timer);
+      rejectP(e instanceof Error ? e : new Error(String(e)));
+    }
+  });
+}
+
+async function transcribeViaResident(abs: string, scfg: SttConfig): Promise<TranscriptionResult> {
+  const w = getSttWorker(scfg);
+  try {
+    return await sendJob(w, { id: `t${++sttJobSeq}`, path: abs }, STT_JOB_TIMEOUT_MS);
+  } catch (e) {
+    // Timeout leaves the singleton alive unless it fired twice concurrently
+    // (wedge kill above); spawn/pipe failures land here too via close->reject.
+    throw e instanceof Error ? e : new Error(String(e));
+  }
+}
+
+let sttJobSeq = 0;
+
+/**
+ * Preload the resident model without transcribing anything. Non-fatal by
+ * contract: resolves true when the worker answered, false otherwise (caller
+ * decides whether to care — bridge warmup wiring is coordinator-owned).
+ */
+export async function warmupResident(timeoutMs = 60_000): Promise<boolean> {
+  try {
+    const scfg = loadSttConfig();
+    if (!scfg.enabled) return false;
+    const w = getSttWorker(scfg);
+    await sendJob(w, { id: `warmup${++sttJobSeq}`, op: "load" }, timeoutMs);
+    return true;
+  } catch (e) {
+    console.error(`[stt] warmupResident failed: ${e instanceof Error ? e.message : e}`);
+    return false;
+  }
 }
