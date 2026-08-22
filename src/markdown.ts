@@ -131,7 +131,9 @@ export function formatMessage(content: string): string {
   const placeholders = new Map<string, string>();
   // Per-call random prefix (w1 review #7): an attacker-crafted literal
   // "\u0000PH0\u0000" in the input can no longer collide with a real key.
-  const nonce = Math.random().toString(36).slice(2, 8);
+  // Padded to a stable 6 chars: short base36 fractions must not degenerate
+  // into the old collision-prone shape.
+  const nonce = (Math.random().toString(36).slice(2) + "000000").slice(0, 6);
   let counter = 0;
   const ph = (value: string): string => {
     const key = `\u0000${nonce}PH${counter}\u0000`;
@@ -199,7 +201,8 @@ export function formatMessage(content: string): string {
   // split/join scan of the full text per placeholder, O(n·p²)). Nested refs
   // resolve depth-first inside the replacer, preserving the old
   // reverse-insertion-order semantics. Work is linear in output size.
-  // A fresh /g regex per recursion level avoids lastIndex reentrancy.
+  // One shared /g regex is safe across recursion levels: String.replace
+  // collects all matches before invoking replacers (owl w4 #2).
   const keyRe = new RegExp(`\u0000${nonce}PH([0-9]+)\u0000`, "g");
   const restorePlaceholders = (s: string): string =>
     s.replace(keyRe, (tok, i: string) => {
