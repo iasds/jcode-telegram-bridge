@@ -309,3 +309,66 @@ test("hardCapMs: real-timer smoke test — starving burst flushes by the cap", a
   assert.deepEqual(calls, [{ chatId: 3, text: "a\nb\nc" }], "hard cap flushed the starved buffer");
   assert.equal(agg.pendingCount(), 0);
 });
+
+// ── Orphaned hard-cap timer regression (owl review finding) ────────────────
+
+test("hardCapMs: cap timer is cancelled when the buffer flushes early", () => {
+  let clock = 0;
+  const sched = makeClockScheduler(() => clock);
+  const calls = [];
+  const agg = new TextBatchAggregator((id, text) => calls.push({ id, text }), {
+    maxWaitMs: 50,
+    hardCapMs: 120,
+    schedule: sched.schedule,
+    now: () => clock,
+  });
+  agg.push(1, "m1"); // arms quiet @50 and cap @120
+  clock = 50;
+  sched.fireDue(); // quiet flush; buffer gone
+  clock = 120;
+  assert.equal(sched.fireDue(), 0, "cap timer must not survive its own buffer's flush");
+  assert.equal(calls.length, 1);
+});
+
+test("hardCapMs: stale cap timer from an old burst must not flush a new buffer early", () => {
+  let clock = 0;
+  const sched = makeClockScheduler(() => clock);
+  const calls = [];
+  const agg = new TextBatchAggregator((id, text) => calls.push({ id, text }), {
+    maxWaitMs: 50,
+    hardCapMs: 120,
+    schedule: sched.schedule,
+    now: () => clock,
+  });
+  agg.push(1, "burst-one"); // quiet @50, cap @120
+  clock = 50;
+  sched.fireDue(); // flushes burst-one via quiet timer
+  assert.equal(calls.length, 1);
+  clock = 110;
+  agg.push(1, "burst-two-a"); // new generation: quiet @160, fresh cap @230
+  clock = 120; // OLD cap deadline reached
+  assert.equal(sched.fireDue(), 0, "stale cap timer must be cancelled on flush");
+  clock = 160; // new generation's quiet timer
+  assert.equal(sched.fireDue(), 1, "only the new generation's quiet timer fires");
+  assert.deepEqual(calls, [
+    { id: 1, text: "burst-one" },
+    { id: 1, text: "burst-two-a" },
+  ]);
+});
+
+test("destroy() cancels hard-cap timers too", () => {
+  let clock = 0;
+  const sched = makeClockScheduler(() => clock);
+  const calls = [];
+  const agg = new TextBatchAggregator((id, text) => calls.push({ id, text }), {
+    maxWaitMs: 50,
+    hardCapMs: 120,
+    schedule: sched.schedule,
+    now: () => clock,
+  });
+  agg.push(1, "m1");
+  agg.destroy();
+  clock = 120;
+  assert.equal(sched.fireDue(), 0, "cap timer must not fire after destroy()");
+  assert.equal(calls.length, 0);
+});

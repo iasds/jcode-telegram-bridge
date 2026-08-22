@@ -43,6 +43,8 @@ export type FlushFn = (chatId: number, text: string) => void;
 interface ChatBuffer {
   parts: string[];
   cancelTimer: (() => void) | null;
+  /** Cancel handle for the P-03-lite hard-cap timer (must not outlive the buffer). */
+  cancelCapTimer: (() => void) | null;
   /** Timestamp (ms, from `now`) of the buffer's FIRST part; hard-cap anchor. */
   firstPushAt?: number;
 }
@@ -75,7 +77,7 @@ export class TextBatchAggregator {
   push(chatId: number, text: string): void {
     let buf = this.buffers.get(chatId);
     if (!buf) {
-      buf = { parts: [], cancelTimer: null };
+      buf = { parts: [], cancelTimer: null, cancelCapTimer: null };
       this.buffers.set(chatId, buf);
     }
     if (buf.parts.length === 0) buf.firstPushAt = this.now();
@@ -118,6 +120,7 @@ export class TextBatchAggregator {
   destroy(): void {
     for (const buf of this.buffers.values()) {
       buf.cancelTimer?.();
+      buf.cancelCapTimer?.();
     }
     this.buffers.clear();
   }
@@ -131,9 +134,19 @@ export class TextBatchAggregator {
     // P-03-lite: hard cap on TOTAL buffer age, immune to quiet-period
     // resets. One timer per buffer, armed on the first part only; when it
     // fires, the buffer is flushed even if the burst never quiets down.
+    // The cancel handle is tracked on the buffer: an orphaned cap timer
+    // would otherwise flush a LATER buffer generation for the same chatId
+    // too early (splitting a fresh burst) and survive destroy().
     if (this.hardCapMs !== undefined && buf.parts.length === 1) {
       const remainingCap = this.hardCapMs - (this.now() - buf.firstPushAt!);
-      this.schedule(() => this.flush(chatId), Math.max(0, remainingCap));
+      buf.cancelCapTimer?.();
+      buf.cancelCapTimer = this.schedule(
+        () => {
+          buf.cancelCapTimer = null;
+          this.flush(chatId);
+        },
+        Math.max(0, remainingCap),
+      );
     }
   }
 
@@ -142,6 +155,8 @@ export class TextBatchAggregator {
     if (!buf) return;
     buf.cancelTimer?.();
     buf.cancelTimer = null;
+    buf.cancelCapTimer?.();
+    buf.cancelCapTimer = null;
     this.buffers.delete(chatId);
     this.flushFn(chatId, buf.parts.join(this.join));
   }
