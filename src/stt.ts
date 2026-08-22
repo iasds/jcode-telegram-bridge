@@ -311,8 +311,14 @@ function wireWorker(w: SttWorker): void {
       else p.resolve({ success: false, transcript: "", provider: String(reply.provider ?? "local"), error: reply.error ? String(reply.error).slice(0, 800) : "worker reported failure" });
     }
   });
+  // Node emits BOTH 'error' and 'close' when spawn itself fails (broken
+  // python env — precisely the scenario the death metric targets), so latch
+  // per-worker: only the first lifecycle event may record a death.
+  let deathRecorded = false;
   const died = (why: string) => {
     if (w.intentionalStop) return; // planned shutdown (fallback/reset): not a death
+    if (deathRecorded) return;
+    deathRecorded = true;
     sttWorkerStats.deaths++;
     console.error(`[stt] resident worker died (${why}); will respawn on next request`);
     if (sttWorkerSingleton === w) sttWorkerSingleton = null; // self-heal: next request respawns
