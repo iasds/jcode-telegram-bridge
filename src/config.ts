@@ -39,7 +39,7 @@ export interface Config {
   stt: SttConfig;
 }
 
-function parseIds(raw: string | undefined): number[] {
+export function parseIds(raw: string | undefined): number[] {
   if (!raw) return [];
   return raw
     .split(",")
@@ -49,7 +49,7 @@ function parseIds(raw: string | undefined): number[] {
     .filter((n) => Number.isFinite(n) && n > 0);
 }
 
-function parseBool(raw: string | undefined, defaultVal: boolean): boolean {
+export function parseBool(raw: string | undefined, defaultVal: boolean): boolean {
   if (raw === undefined || raw === "") return defaultVal;
   const v = raw.toLowerCase().trim();
   if (["0", "false", "off", "no", "disable", "disabled"].includes(v)) return false;
@@ -57,7 +57,7 @@ function parseBool(raw: string | undefined, defaultVal: boolean): boolean {
   return defaultVal;
 }
 
-function clampInt(raw: string | undefined, def: number, min: number, max: number, label: string): number {
+export function clampInt(raw: string | undefined, def: number, min: number, max: number, label: string): number {
   if (raw === undefined || raw === "") return def;
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) {
