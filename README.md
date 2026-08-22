@@ -121,6 +121,10 @@ npm test   # node --test — 40 cases (markdown 14, stream 14, truncate, logic 1
 - **Stream stages**: `[stream] connect → connected → attach → attached →
   consuming events → turn_done (N events) → loop end → finished`. If it
   stops before `attached`, the session is likely broken (rotation kicks in).
+- `/status` includes an STT health line (`STT worker: resident (fast) |
+  down, inline fallback | idle`, with `deaths:N respawns:M` after crashes)
+  and poll failures escalate: >=10 `getUpdates` errors within one hour log
+  a `NETWORK HEALTH` warning once per hour (proxy-chain degradation signal).
 - **STT**: each voice logs `[stt] voice ok|fail provider=… dur=…ms`. A
   resident Python worker (`src/stt_worker.py`) loads `faster-whisper
   small (zh)` once at boot (`[stt_worker] model 'small' loaded …` /
@@ -145,5 +149,8 @@ npm test   # node --test — 40 cases (markdown 14, stream 14, truncate, logic 1
 - The proxy (Clash) can still stall long-poll bodies; the 45s whole-read
   timeout mitigates it. If the bridge goes deaf, watch journald
   `getUpdates error` and `NRestarts`.
-- Media input (photos/documents) is deferred: the current model has no
-  vision capability.
+- Photos are not supported (no vision capability in the current model).
+  Text documents ARE handled inline (text/* or known text extensions up to
+  `MAX_INLINE_DOC_BYTES`, content injected as `[Content of <name>]:`); other
+  files are announced as attachments. Voice/audio/video_note are fully
+  supported via the STT pipeline above.
