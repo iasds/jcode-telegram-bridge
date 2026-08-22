@@ -39,7 +39,6 @@ export class PollErrorLogger {
   /** Sliding-window failure tally for hourly health escalation (P2). */
   private recentFailures: number[] = [];
   /** Last hour-boundary at which an hourly summary was emitted. */
-  private lastSummaryHour = -1;
 
   constructor(private readonly label: string) {}
 

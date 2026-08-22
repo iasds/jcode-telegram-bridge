@@ -94,7 +94,7 @@ sudo loginctl enable-linger "$USER"   # auto-start on boot
 ## Testing
 
 ```bash
-npm test   # node --test — 40 cases (markdown 14, stream 14, truncate, logic 12)
+npm test   # node --test — full suite (see test/; currently 138 cases)
 ```
 
 ## Files
