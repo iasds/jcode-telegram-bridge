@@ -929,6 +929,23 @@ console.log(`[bridge] started. bot=${cfg.botToken.split(":")[0]} allowed=${cfg.a
 // 30s past startup and repeat hourly; unref so it never holds the process open.
 setTimeout(() => pruneVoiceDurables(), 30_000).unref();
 setInterval(() => pruneVoiceDurables(), 3600_000).unref();
+
+// w1 review follow-up: a crash between voice tmp write and cleanup leaves
+// private audio in /tmp indefinitely. Sweep stale files (1h+) at startup.
+{
+  const { readdirSync: _rd, unlinkSync: _ul, statSync: _st } = await import("node:fs");
+  const tmpdir = (await import("node:os")).tmpdir();
+  try {
+    const cutoff = Date.now() - 3_600_000;
+    for (const name of _rd(tmpdir)) {
+      if (!name.startsWith("jcode-voice-")) continue;
+      const p = join(tmpdir, name);
+      try {
+        if (_st(p).mtimeMs < cutoff) { _ul(p); console.log(`[bridge] swept stale voice tmp: ${name}`); }
+      } catch { /* concurrently removed */ }
+    }
+  } catch { /* best-effort hygiene */ }
+}
 void warmupStt();
 
 bot.catch((err, ctx) => {

@@ -129,9 +129,12 @@ export function formatMessage(content: string): string {
   if (!content) return content;
 
   const placeholders = new Map<string, string>();
+  // Per-call random prefix (w1 review #7): an attacker-crafted literal
+  // "\u0000PH0\u0000" in the input can no longer collide with a real key.
+  const nonce = Math.random().toString(36).slice(2, 8);
   let counter = 0;
   const ph = (value: string): string => {
-    const key = `\u0000PH${counter}\u0000`;
+    const key = `\u0000${nonce}PH${counter}\u0000`;
     counter++;
     placeholders.set(key, value);
     return key;
@@ -197,9 +200,10 @@ export function formatMessage(content: string): string {
   // resolve depth-first inside the replacer, preserving the old
   // reverse-insertion-order semantics. Work is linear in output size.
   // A fresh /g regex per recursion level avoids lastIndex reentrancy.
+  const keyRe = new RegExp(`\u0000${nonce}PH([0-9]+)\u0000`, "g");
   const restorePlaceholders = (s: string): string =>
-    s.replace(/\u0000PH(\d+)\u0000/g, (tok, i: string) => {
-      const value = placeholders.get(`\u0000PH${i}\u0000`);
+    s.replace(keyRe, (tok, i: string) => {
+      const value = placeholders.get(`\u0000${nonce}PH${i}\u0000`);
       // Unknown index: leave the token verbatim (legacy split/join parity —
       // only keys present in the map were ever replaced).
       return value === undefined ? tok : restorePlaceholders(value);
