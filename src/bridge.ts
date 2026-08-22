@@ -153,6 +153,7 @@ const clientReady = new Promise<JcodeClient>((res, rej) => {
 const connectPromise = connectWithRetry().then(
   (c) => {
     client = c;
+    store.setClient(c); // ctor captured undefined (async connect) — backfill now
     resolveClient(c);
     attachClientLifecycle(c);
     return c;

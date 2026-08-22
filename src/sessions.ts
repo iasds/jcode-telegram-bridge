@@ -40,12 +40,21 @@ export class SessionStore {
     private client: JcodeClient,
     private cfg: Config,
   ) {
+    // NOTE: `client` is captured by value. bridge.ts declares `let client!`
+    // and connects ASYNC — at store-construction time it is still undefined.
+    // setClient() must be called once the connection resolves, otherwise
+    // createSession throws "Cannot read properties of undefined".
     try {
       const raw = JSON.parse(readFileSync(cfg.stateFile, "utf8")) as Persisted;
       this.chats = raw.chats ?? {};
     } catch {
       this.chats = {};
     }
+  }
+
+  /** Backfill the harness client once connectWithRetry resolves (see ctor note). */
+  setClient(c: JcodeClient): void {
+    this.client = c;
   }
 
   /**
