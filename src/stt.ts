@@ -92,20 +92,30 @@ function hermesAgentDir(): string {
   return (process.env.HERMES_AGENT_DIR ?? `${process.env.HOME ?? "/home/user"}/.jcode/scratch/hermes-agent`).trim();
 }
 
+/**
+ * w2 stability: existence + size gate, extracted as a pure-ish unit so the
+ * fail-closed branch is directly testable (a stat failure here previously
+ * fell through to spawn anyway, wasting a python boot and failing later with
+ * an opaque worker error). Returns an error string when the caller must bail,
+ * or null when the file is present and within budget.
+ */
+export function statGate(abs: string): string | null {
+  if (!existsSync(abs)) return `file not found: ${abs}`;
+  try {
+    const st = statSync(abs);
+    if (st.size > STT_MAX_FILE_BYTES) return `file too large: ${(st.size / 1024 / 1024).toFixed(1)}MB > 25MB`;
+    return null;
+  } catch (e) {
+    return `stat failed: ${e instanceof Error ? e.message : e}`;
+  }
+}
+
 export async function transcribeAudio(filePath: string, cfg?: SttConfig): Promise<TranscriptionResult> {
   const scfg = cfg ?? loadSttConfig();
   if (!scfg.enabled) return { success: false, transcript: "", provider: "none", error: "STT disabled" };
   const abs = resolve(filePath);
-  if (!existsSync(abs)) return { success: false, transcript: "", provider: "none", error: `file not found: ${abs}` };
-  // w2 stability: a stat failure here (vanished file, perms) previously fell
-  // through to spawn anyway, wasting a python boot and failing later with an
-  // opaque worker error. Fail closed with the actual reason instead.
-  try {
-    const st = statSync(abs);
-    if (st.size > STT_MAX_FILE_BYTES) return { success: false, transcript: "", provider: "none", error: `file too large: ${(st.size / 1024 / 1024).toFixed(1)}MB > 25MB` };
-  } catch (e) {
-    return { success: false, transcript: "", provider: "none", error: `stat failed: ${e instanceof Error ? e.message : e}` };
-  }
+  const gateErr = statGate(abs);
+  if (gateErr) return { success: false, transcript: "", provider: "none", error: gateErr };
 
   const code = `
 import json, sys, os
@@ -157,7 +167,7 @@ print(json.dumps(res, ensure_ascii=False))
             error: j.error ? String(j.error) : undefined,
           });
           return;
-        } catch {} // SIGTERM on dying worker is best-effort; close handler rejects pendings // JSON parse of inline output failed -> fall through to stderr surfacing below
+        } catch {} // JSON parse of inline output failed -> fall through to stderr surfacing below
       }
       // non-zero or no JSON: surface stderr
       const msg = (err || out).slice(0, 800).trim() || `exit ${code}`;
@@ -241,7 +251,7 @@ export function resetSttWorker(): void {
   w.pending.clear();
   try {
     w.child.kill("SIGTERM"); // python handler finishes current line then exits 0
-  } catch {}
+  } catch {} // kill on dying/already-dead worker is best-effort; close handler rejects pendings
 }
 
 function failAllPending(w: SttWorker, why: string): void {

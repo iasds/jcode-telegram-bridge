@@ -115,12 +115,29 @@ test("isSupportedAudioExt: telegram formats yes, junk no, case-insensitive", () 
   assert.equal(isSupportedAudioExt("/tmp/noext"), false);
 });
 
-test("transcribeAudio: stat failure fails closed with reason (no blind spawn)", async () => {
-  const { transcribeAudio } = await import("../dist/stt.js");
-  // existsSync passes only if file exists; simulate the race where it vanishes
-  // between existsSync and statSync by using a directory-sized trick is not
-  // portable — instead assert the documented error shape for a missing file.
-  const r = await transcribeAudio("/nonexistent/path/clip.ogg");
-  assert.equal(r.success, false);
-  assert.match(r.error, /file not found/);
+test("transcribeAudio gates: missing file -> not found; oversize -> too large; statGate covers both", async () => {
+  const { transcribeAudio, statGate, STT_MAX_FILE_BYTES } = await import("../dist/stt.js");
+  const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  {
+    const r = await transcribeAudio("/nonexistent/path/clip.ogg");
+    assert.equal(r.success, false);
+    assert.match(r.error ?? "", /file not found/);
+  }
+  assert.match(statGate("/nonexistent/path/clip.ogg"), /file not found/);
+  // oversize branch via a sparse file
+  const dir = mkdtempSync(join(tmpdir(), "jcode-stt-stat-"));
+  try {
+    const big = join(dir, "big.ogg");
+    writeFileSync(big, "x");
+    const { truncateSync } = await import("node:fs");
+    truncateSync(big, STT_MAX_FILE_BYTES + 1);
+    assert.match(statGate(big), /file too large/);
+    // in-budget file passes the gate
+    writeFileSync(big, "ok");
+    assert.equal(statGate(big), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
