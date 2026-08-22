@@ -5,6 +5,7 @@ import type { Config } from "./config.js";
 import { formatMessage, stripMdv2, escapeMdv2 } from "./markdown.js";
 import type { SessionStore } from "./sessions.js";
 import type { TurnRenderer } from "./events.js";
+import { getSttWorkerStats } from "./stt.js";
 
 const HELP = `
 *Jcode Telegram Bridge*
@@ -96,8 +97,10 @@ export async function handleCommand(
         }
         const depths = store.allQueueDepths().map(([c, d]) => `${c}:${d}`).join(", ") || "none";
         const active = hooks.activeTurns ? hooks.activeTurns() : -1;
+        const ws = getSttWorkerStats();
+        const sttLine = `STT worker: ${ws.alive ? "resident (fast)" : ws.deaths > 0 ? "down, inline fallback" : "idle"}${ws.deaths > 0 ? ` | deaths:${ws.deaths} respawns:${ws.respawns}` : ""}`;
         await reply(
-          `*Status*\nBridge: running\ndaemon: online\nPersistent sessions: ${sessions.length}\nBound Telegram chats: ${store.all().length}\nPoll offset: ${offset ?? "n/a"}\nQueue depth: ${escapeMdv2(depths)}\nActive turns: ${active}`,
+          `*Status*\nBridge: running\ndaemon: online\nPersistent sessions: ${sessions.length}\nBound Telegram chats: ${store.all().length}\nPoll offset: ${offset ?? "n/a"}\nQueue depth: ${escapeMdv2(depths)}\nActive turns: ${active}\n${sttLine}`,
         );
       } catch (err) {
         await reply(`*Status*\ndaemon connection failed: ${escapeMdv2(String(err))}`);

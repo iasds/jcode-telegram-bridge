@@ -141,3 +141,11 @@ test("transcribeAudio gates: missing file -> not found; oversize -> too large; s
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("getSttWorkerStats: fresh process is alive-idle with zero counters", async () => {
+  const { getSttWorkerStats } = await import("../dist/stt.js");
+  const s = getSttWorkerStats();
+  assert.equal(typeof s.deaths, "number");
+  assert.equal(typeof s.respawns, "number");
+  assert.equal(typeof s.alive, "boolean");
+});

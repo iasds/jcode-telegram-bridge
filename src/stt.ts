@@ -239,6 +239,24 @@ interface SttWorker {
 
 let sttWorkerSingleton: SttWorker | null = null;
 
+/**
+ * w3 observability: lifetime worker health counters. Exposed so /status can
+ * show whether transcription is running on the fast resident path or has
+ * been degraded to spawn-per-request fallbacks (a rising death count with
+ * no recovery is the signature of a persistently broken python env).
+ */
+export interface SttWorkerStats {
+  deaths: number;
+  respawns: number;
+  alive: boolean;
+}
+
+const sttWorkerStats = { deaths: 0, respawns: 0 };
+
+export function getSttWorkerStats(): SttWorkerStats {
+  return { ...sttWorkerStats, alive: sttWorkerSingleton !== null };
+}
+
 export function resetSttWorker(): void {
   const w = sttWorkerSingleton;
   sttWorkerSingleton = null;
@@ -291,6 +309,8 @@ function wireWorker(w: SttWorker): void {
     }
   });
   const died = (why: string) => {
+    sttWorkerStats.deaths++;
+    console.error(`[stt] resident worker died (${why}); will respawn on next request`);
     if (sttWorkerSingleton === w) sttWorkerSingleton = null; // self-heal: next request respawns
     failAllPending(w, why);
   };
@@ -300,6 +320,11 @@ function wireWorker(w: SttWorker): void {
 
 function getSttWorker(scfg: SttConfig): SttWorker {
   if (sttWorkerSingleton) return sttWorkerSingleton;
+  if (sttWorkerStats.deaths > sttWorkerStats.respawns) {
+    // first respawn after a death: log recovery so operators see the fast path return
+    sttWorkerStats.respawns++;
+    console.warn(`[stt] respawning resident worker (death #${sttWorkerStats.deaths})`);
+  }
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (!env.HERMES_LOCAL_STT_LANGUAGE && scfg.language) env.HERMES_LOCAL_STT_LANGUAGE = scfg.language;
   env.PYTHONPATH = [hermesAgentDir(), env.PYTHONPATH ?? ""].filter(Boolean).join(":");
