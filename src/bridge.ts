@@ -1,5 +1,6 @@
 import { JcodeClient, HarnessError } from "@1jehuang/jcode-sdk";
 import { Telegraf } from "telegraf";
+import type { Telegram } from "telegraf";
 import https from "node:https";
 import { chmodSync, readFileSync, readdirSync, statSync, unlinkSync, existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -446,7 +447,27 @@ bot.on("text", async (ctx) => {
 const TEXT_EXT = /\.(txt|md|markdown|json|log|csv|py|js|ts|tsx|jsx|go|rs|java|c|cpp|h|hpp|sh|bash|zsh|yaml|yml|toml|ini|xml|html|css|sql|env|conf|cfg)$/i;
 const MAX_INLINE_DOC_BYTES = 100_000;
 
-function mediaDeliver(chatId: number, ctx: any, text: string, immediate = false): void {
+// P4: minimal structural type for media handlers — only the fields the
+// voice/document path actually reads. Telegraf's full Context stays at the
+// bot.on() call sites; these helpers never touch update machinery.
+interface MediaContext {
+  chat?: { id: number; type?: string };
+  from?: { id: number };
+  message?: {
+    message_id?: number;
+    caption?: string;
+    voice?: { file_id: string; file_size?: number };
+    audio?: { file_id: string; file_size?: number };
+    video_note?: { file_id: string; file_size?: number };
+    document?: { file_id: string; file_name?: string; file_size?: number; mime_type?: string };
+  };
+  /** Only these telegram methods are used on the media path (events.ts renderers). */
+  telegram: Pick<Telegram, "getFile" | "sendMessage" | "editMessageText">;
+  /** ST-04 prefetch stash (set by handlers, consumed in route()). */
+  __sessionPrefetch?: Promise<unknown>;
+}
+
+function mediaDeliver(chatId: number, ctx: MediaContext, text: string, immediate = false): void {
   if (cfg.chatOnly && ctx.chat?.type !== "private") return;
   cappedSet(lastCtx, chatId, ctx);
   renderer.cacheContext(chatId, ctx);
@@ -462,8 +483,8 @@ function fmtBytes(n: number): string {
   return `${n} B`;
 }
 
-async function handleDocument(ctx: any): Promise<void> {
-  const chatId = ctx.chat.id;
+async function handleDocument(ctx: MediaContext): Promise<void> {
+  const chatId = ctx.chat?.id;
   const fromId = ctx.from?.id;
   if (!chatId || !allowed(fromId)) return;
   // ST-04: fire-and-forget session prefetch, same rationale as handleVoice —
@@ -471,11 +492,12 @@ async function handleDocument(ctx: any): Promise<void> {
   // round-trip with it. Set unconditionally at entry so every downstream
   // mediaDeliver->route() turn body can await it (see ordering proof there).
   const sessionPrefetch = store.getOrCreateSafe(chatId).catch(() => undefined);
-  (ctx as any).__sessionPrefetch = sessionPrefetch;
-  const doc = ctx.message.document;
+  ctx.__sessionPrefetch = sessionPrefetch;
+  const doc = ctx.message?.document;
+  if (!doc) return;
   const name = doc.file_name ?? "document";
   const size = doc.file_size ?? 0;
-  const caption = ctx.message.caption ?? "";
+  const caption = ctx.message?.caption ?? "";
   const isText =
     TEXT_EXT.test(name) || (typeof doc.mime_type === "string" && doc.mime_type.startsWith("text/"));
   if (!isText || size > MAX_INLINE_DOC_BYTES) {
@@ -573,7 +595,7 @@ async function downloadTelegramFile(fileId: string): Promise<{ path: string; ext
   return { path: tmpPath, ext, durablePath };
 }
 
-async function handleVoice(ctx: any, kind: "voice" | "audio" | "video_note"): Promise<void> {
+async function handleVoice(ctx: MediaContext, kind: "voice" | "audio" | "video_note"): Promise<void> {
   const chatId = ctx.chat?.id;
   const fromId = ctx.from?.id;
   if (!chatId || !allowed(fromId)) return;
@@ -613,7 +635,7 @@ async function handleVoice(ctx: any, kind: "voice" | "audio" | "video_note"): Pr
   // after it inside route()'s queue. Consumed in route(); see the ordering
   // proof there for why awaiting it inside the turn cannot deadlock.
   const sessionPrefetch = store.getOrCreateSafe(chatId).catch(() => undefined);
-  (ctx as any).__sessionPrefetch = sessionPrefetch;
+  ctx.__sessionPrefetch = sessionPrefetch;
 
   let tmpPath: string | null = null;
   let durableVoicePath: string | null = null;

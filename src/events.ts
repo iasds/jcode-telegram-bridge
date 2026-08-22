@@ -1,4 +1,14 @@
-import type { Context } from "telegraf";
+import type { Context, Telegram } from "telegraf";
+
+/**
+ * Minimal structural view of a Telegraf context for caching. Renderers only
+ * call ctx.telegram.{sendMessage,editMessageText} on cached contexts; this
+ * lets media handlers pass lightweight contexts without the full update
+ * machinery. Full telegraf Context is trivially assignable to it.
+ */
+export interface CachedContext {
+  telegram: Pick<Telegram, "getFile" | "sendMessage" | "editMessageText">;
+}
 import { formatMessage, stripMdv2 } from "./markdown.js";
 import { truncateMessage } from "./truncate.js";
 
@@ -34,11 +44,11 @@ function retryAfterMs(err: unknown): number | undefined {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export class TurnRenderer {
-  private ctxCache = new Map<number, Context>();
+  private ctxCache = new Map<number, CachedContext>();
 
   constructor(private opts: RendererOptions = {}) {}
 
-  cacheContext(chatId: number, ctx: Context): void {
+  cacheContext(chatId: number, ctx: CachedContext): void {
     // M-01a: at cap, drop the OLDEST key before inserting a new one
     // (Map preserves insertion order; keys()[0] is the oldest).
     if (!this.ctxCache.has(chatId) && this.ctxCache.size >= CTX_CACHE_CAP) {
@@ -82,7 +92,7 @@ export class TurnRenderer {
   }
 
   private async sendRetry(
-    ctx: Context,
+    ctx: CachedContext,
     chatId: number,
     text: string,
     extra: Record<string, unknown>,
