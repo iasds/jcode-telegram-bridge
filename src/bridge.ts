@@ -75,18 +75,18 @@ function pruneVoiceDurables(): void {
         const st = statSync(p);
         if (!st.isFile()) continue;
         if (now - st.mtimeMs > maxAgeMs) {
-          try { unlinkSync(p); } catch {}
+          try { unlinkSync(p); } catch {} // best-effort prune: next sweep retries
           continue;
         }
         items.push({ name, mtime: st.mtimeMs, size: st.size });
         total += st.size;
-      } catch {}
+      } catch {} // prune scan failures are non-fatal; retried hourly
     }
     if (total > maxBytes) {
       items.sort((a, b) => a.mtime - b.mtime);
       for (const it of items) {
         if (total <= maxBytes) break;
-        try { unlinkSync(join(dir, it.name)); total -= it.size; } catch {}
+        try { unlinkSync(join(dir, it.name)); total -= it.size; } catch {} // already gone is fine
       }
       console.log(`[prune] voice durables pruned to ${(total / 1024 / 1024).toFixed(1)}MB`);
     }
@@ -199,6 +199,19 @@ const openModelPicker = async (chatId: number, replyTo?: number): Promise<void> 
 // socket and every turn fails silently.
 function fatalExit(reason: string): never {
   console.error(`[bridge] fatal connection error (${reason}); exiting for systemd restart`);
+  // w2 stability: bounded pre-mortem snapshot so post-mortem diagnosis does
+  // not depend on journal archaeology. Best-effort: never blocks the exit.
+  try {
+    const snapshot = {
+      at: new Date().toISOString(),
+      reason,
+      uptimeMs: Math.round(process.uptime() * 1000),
+      mem: process.memoryUsage().rss,
+      activeTurns: activeTurns.size,
+      lastAttachSession,
+    };
+    writeFileAtomic(join(dirname(cfg.stateFile), "fatal-snapshot.json"), JSON.stringify(snapshot, null, 2), 0o600);
+  } catch { /* snapshot is advisory only */ }
   process.exit(1);
 }
 
@@ -551,7 +564,7 @@ async function downloadTelegramFile(fileId: string): Promise<{ path: string; ext
     mkdirSync(durableDir, { recursive: true, mode: 0o700 });
     // w1 review: mode only applies to newly-created leaves; force pre-existing dirs too.
     chmodSync(durableDir, 0o700);
-  } catch {}
+  } catch (e) { console.error("[bridge] durable dir prep failed:", e); } // non-fatal: durable write below re-logs
   const rawBase = (file.file_path.split("/").pop() ?? `voice-${Date.now()}${ext}`).split("?")[0];
   const durableName = `${Date.now()}-${randomBytes(6).toString("hex")}-${baseName(rawBase)}`;
   const finalDurable = durableName.includes(".") ? durableName : `${durableName}${ext}`;
@@ -639,7 +652,7 @@ async function handleVoice(ctx: any, kind: "voice" | "audio" | "video_note"): Pr
     console.error(`[stt] ${kind} error:`, err?.message ?? err);
     mediaDeliver(chatId, ctx, `🎤 [voice message — transcription failed: ${String(err?.message ?? err).slice(0, 200)}]${caption ? ` Caption: ${caption}` : ""}`);
   } finally {
-    if (tmpPath) { try { const { unlinkSync } = await import("node:fs"); unlinkSync(tmpPath); } catch {} }
+    if (tmpPath) { try { const { unlinkSync } = await import("node:fs"); unlinkSync(tmpPath); } catch {} } // already-deleted tmp is fine
   }
 }
 bot.on("sticker", (ctx) => {

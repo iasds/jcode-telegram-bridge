@@ -97,10 +97,15 @@ export async function transcribeAudio(filePath: string, cfg?: SttConfig): Promis
   if (!scfg.enabled) return { success: false, transcript: "", provider: "none", error: "STT disabled" };
   const abs = resolve(filePath);
   if (!existsSync(abs)) return { success: false, transcript: "", provider: "none", error: `file not found: ${abs}` };
+  // w2 stability: a stat failure here (vanished file, perms) previously fell
+  // through to spawn anyway, wasting a python boot and failing later with an
+  // opaque worker error. Fail closed with the actual reason instead.
   try {
     const st = statSync(abs);
     if (st.size > STT_MAX_FILE_BYTES) return { success: false, transcript: "", provider: "none", error: `file too large: ${(st.size / 1024 / 1024).toFixed(1)}MB > 25MB` };
-  } catch {}
+  } catch (e) {
+    return { success: false, transcript: "", provider: "none", error: `stat failed: ${e instanceof Error ? e.message : e}` };
+  }
 
   const code = `
 import json, sys, os
@@ -152,7 +157,7 @@ print(json.dumps(res, ensure_ascii=False))
             error: j.error ? String(j.error) : undefined,
           });
           return;
-        } catch {}
+        } catch {} // SIGTERM on dying worker is best-effort; close handler rejects pendings // JSON parse of inline output failed -> fall through to stderr surfacing below
       }
       // non-zero or no JSON: surface stderr
       const msg = (err || out).slice(0, 800).trim() || `exit ${code}`;
@@ -312,7 +317,7 @@ function sendJob(w: SttWorker, job: Record<string, unknown>, timeoutMs: number):
         w.wedgedTimer = setTimeout(() => {
           try {
             w.child.kill("SIGKILL");
-          } catch {}
+          } catch {} // SIGKILL escalation best-effort; process may have exited already
         }, STT_WORKER_WEDGE_GRACE_MS);
         w.wedgedTimer.unref?.();
       }

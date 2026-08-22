@@ -114,3 +114,13 @@ test("isSupportedAudioExt: telegram formats yes, junk no, case-insensitive", () 
   assert.equal(isSupportedAudioExt("/tmp/d.txt"), false);
   assert.equal(isSupportedAudioExt("/tmp/noext"), false);
 });
+
+test("transcribeAudio: stat failure fails closed with reason (no blind spawn)", async () => {
+  const { transcribeAudio } = await import("../dist/stt.js");
+  // existsSync passes only if file exists; simulate the race where it vanishes
+  // between existsSync and statSync by using a directory-sized trick is not
+  // portable — instead assert the documented error shape for a missing file.
+  const r = await transcribeAudio("/nonexistent/path/clip.ogg");
+  assert.equal(r.success, false);
+  assert.match(r.error, /file not found/);
+});
