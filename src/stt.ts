@@ -47,6 +47,29 @@ export interface SttConfig {
   localModel: string; // default small (hermes default base)
 }
 
+/** Models faster-whisper can load here; anything else fails at load time. */
+export const VALID_STT_MODELS = ["tiny", "base", "small", "medium", "large-v3"] as const;
+const VALID_STT_MODEL_SET = new Set<string>(VALID_STT_MODELS);
+
+/**
+ * Resolve STT_LOCAL_MODEL against the known set (README "config hardening"
+ * contract): empty -> small, case-normalized, unknown values fall back to
+ * small WITH a warning instead of failing later inside faster-whisper with
+ * an opaque load error.
+ */
+export function resolveLocalModel(raw: string | undefined): string {
+  const v = (raw ?? "").trim().toLowerCase();
+  if (!v) return "small";
+  if (!VALID_STT_MODEL_SET.has(v)) {
+    const original = (raw ?? "").trim();
+    console.warn(
+      `[stt] unknown STT_LOCAL_MODEL '${original}' — falling back to 'small' (supported: ${VALID_STT_MODELS.join("/")})`,
+    );
+    return "small";
+  }
+  return v;
+}
+
 export function loadSttConfig(env = process.env): SttConfig {
   const enabledRaw = env.STT_ENABLED;
   const enabled = enabledRaw === undefined ? true : !["0", "false", "off", "no"].includes(enabledRaw.toLowerCase());
@@ -57,7 +80,7 @@ export function loadSttConfig(env = process.env): SttConfig {
     echoTranscripts,
     provider: (env.STT_PROVIDER ?? env.STT_MODEL_PROVIDER ?? "").trim(),
     language: (env.STT_LANGUAGE ?? env.HERMES_LOCAL_STT_LANGUAGE ?? "zh").trim() || "zh",
-    localModel: (env.STT_LOCAL_MODEL ?? "small").trim() || "small",
+    localModel: resolveLocalModel(env.STT_LOCAL_MODEL),
   };
 }
 
