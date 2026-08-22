@@ -235,6 +235,8 @@ interface SttWorker {
   child: ReturnType<typeof spawn>;
   pending: Map<string, PendingJob>;
   wedgedTimer?: NodeJS.Timeout;
+  /** set by resetSttWorker so the close handler can skip the death counter */
+  intentionalStop?: boolean;
 }
 
 let sttWorkerSingleton: SttWorker | null = null;
@@ -260,6 +262,7 @@ export function getSttWorkerStats(): SttWorkerStats {
 export function resetSttWorker(): void {
   const w = sttWorkerSingleton;
   sttWorkerSingleton = null;
+  if (w) w.intentionalStop = true;
   if (!w) return;
   if (w.wedgedTimer) clearTimeout(w.wedgedTimer);
   for (const [, p] of w.pending) {
@@ -309,6 +312,7 @@ function wireWorker(w: SttWorker): void {
     }
   });
   const died = (why: string) => {
+    if (w.intentionalStop) return; // planned shutdown (fallback/reset): not a death
     sttWorkerStats.deaths++;
     console.error(`[stt] resident worker died (${why}); will respawn on next request`);
     if (sttWorkerSingleton === w) sttWorkerSingleton = null; // self-heal: next request respawns
