@@ -1056,6 +1056,7 @@ async function pollLoop(bot: Telegraf): Promise<void> {
     .catch(() => undefined);
   let offset = loadOffset();
   const errLog = new PollErrorLogger("getUpdates");
+  let errLogHourWarned = -1;
   while (true) {
     let updates: { update_id: number }[];
     try {
@@ -1066,6 +1067,18 @@ async function pollLoop(bot: Telegraf): Promise<void> {
       const msg = err instanceof Error ? err.message : String(err);
       const v = errLog.fail(msg, Date.now());
       if (v.shouldLog) console.error(v.line);
+      // P2: escalate when the trailing hour is packed with failures — that
+      // is a degraded network path (proxy chain/DNS), not isolated blips.
+      {
+        const hourFailures = errLog.failuresInWindow(Date.now());
+        const hour = Math.floor(Date.now() / 3_600_000);
+        if (hourFailures >= 10 && hour !== errLogHourWarned) {
+          errLogHourWarned = hour;
+          console.warn(
+            `[bridge] NETWORK HEALTH: ${hourFailures} getUpdates failures in the last hour — check proxy chain/DNS if this persists`,
+          );
+        }
+      }
       if (v.attempts >= FATAL_ATTEMPTS) {
         fatalExit(`getUpdates failed ${v.attempts}x: ${msg}`);
       }

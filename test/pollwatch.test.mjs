@@ -67,3 +67,22 @@ test("duration formatting crosses minute and hour boundaries", () => {
   const v90s = l.fail("x", T0 + 90_000);
   assert.match(v90s.line, /outage 1.5m/);
 });
+
+test("failuresInWindow: counts only failures inside the trailing window", () => {
+  const l = new PollErrorLogger("getUpdates");
+  l.fail("a", 0);
+  l.fail("b", 100_000);
+  l.fail("c", 200_000);
+  assert.equal(l.failuresInWindow(200_000), 3);
+  assert.equal(l.failuresInWindow(150_000), 2); // first falls out of window
+  assert.equal(l.failuresInWindow(3_600_000 + 200_000), 0); // all aged out
+});
+
+test("failuresInWindow: recover() resets streak but window history persists", () => {
+  const l = new PollErrorLogger("getUpdates");
+  l.fail("a", 0);
+  l.fail("b", 5_000);
+  l.recover(9_000);
+  assert.equal(l.attempts, 0); // streak reset
+  assert.equal(l.failuresInWindow(10_000), 2); // hourly tally unaffected
+});

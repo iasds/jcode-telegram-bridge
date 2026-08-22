@@ -36,8 +36,22 @@ function formatDuration(ms: number): string {
 export class PollErrorLogger {
   private failures = 0;
   private firstFailAt = 0;
+  /** Sliding-window failure tally for hourly health escalation (P2). */
+  private recentFailures: number[] = [];
+  /** Last hour-boundary at which an hourly summary was emitted. */
+  private lastSummaryHour = -1;
 
   constructor(private readonly label: string) {}
+
+  /**
+   * P2: failures in the trailing `windowMs`. When this crosses
+   * `escalateAt`, the caller should WARN that the network path itself may be
+   * degraded (proxy chain, DNS) rather than treating each blip as transient.
+   */
+  failuresInWindow(now: number, windowMs = 3_600_000): number {
+    this.recentFailures = this.recentFailures.filter((t) => now - t < windowMs);
+    return this.recentFailures.length;
+  }
 
   get attempts(): number {
     return this.failures;
@@ -46,6 +60,7 @@ export class PollErrorLogger {
   /** Record one failure; returns what (if anything) to log. */
   fail(msg: string, now: number): FailVerdict {
     this.failures++;
+    this.recentFailures.push(now);
     if (this.failures === 1) this.firstFailAt = now;
     const dur = formatDuration(Math.max(0, now - this.firstFailAt));
     const line =
