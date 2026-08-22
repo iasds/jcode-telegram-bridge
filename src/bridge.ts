@@ -13,6 +13,7 @@ import { TurnRenderer } from "./events.js";
 import { handleCommand, BridgeHooks } from "./commands.js";
 import { sendModelPicker, handleModelPickerCallback } from "./model-picker.js";
 import { StreamingRenderer } from "./stream.js";
+import { PollErrorLogger, FATAL_THRESHOLD as FATAL_ATTEMPTS } from "./pollwatch.js";
 import {
   advanceOffset,
   parseOffset,
@@ -1018,20 +1019,21 @@ async function pollLoop(bot: Telegraf): Promise<void> {
     .setMyShortDescription("Jcode bridge: online")
     .catch(() => undefined);
   let offset = loadOffset();
-  let consecutiveErrors = 0;
+  const errLog = new PollErrorLogger("getUpdates");
   while (true) {
     let updates: { update_id: number }[];
     try {
       updates = await getUpdatesRaw(cfg.botToken, offset, AbortSignal.timeout(45_000));
-      consecutiveErrors = 0;
+      const recovery = errLog.recover(Date.now());
+      if (recovery) console.log(recovery.line);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      consecutiveErrors++;
-      console.error(`[bridge] getUpdates error (${consecutiveErrors}): ${msg}`);
-      if (consecutiveErrors >= 5) {
-        fatalExit(`getUpdates failed ${consecutiveErrors}x: ${msg}`);
+      const v = errLog.fail(msg, Date.now());
+      if (v.shouldLog) console.error(v.line);
+      if (v.attempts >= FATAL_ATTEMPTS) {
+        fatalExit(`getUpdates failed ${v.attempts}x: ${msg}`);
       }
-      await sleep(Math.min(3000 * consecutiveErrors, 15000));
+      await sleep(Math.min(3000 * v.attempts, 15000));
       continue;
     }
     if (updates.length > 0) {
