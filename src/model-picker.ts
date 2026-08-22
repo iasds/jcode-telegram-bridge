@@ -49,7 +49,7 @@ interface KeyboardResult {
   pageInfo: string;
 }
 
-function buildProviderKeyboard(state: PickerState, page: number): KeyboardResult {
+export function buildProviderKeyboard(state: PickerState, page: number): KeyboardResult {
   const total = state.providers.length;
   const totalPages = Math.max(1, Math.ceil(total / PROVIDER_PAGE_SIZE));
   const safePage = Math.max(0, Math.min(page, totalPages - 1));
@@ -75,7 +75,7 @@ function buildProviderKeyboard(state: PickerState, page: number): KeyboardResult
   return { keyboard: { inline_keyboard: rows }, pageInfo };
 }
 
-function buildModelKeyboard(state: PickerState, page: number): KeyboardResult {
+export function buildModelKeyboard(state: PickerState, page: number): KeyboardResult {
   const total = state.modelList.length;
   const totalPages = Math.max(1, Math.ceil(total / MODEL_PAGE_SIZE));
   const safePage = Math.max(0, Math.min(page, totalPages - 1));
