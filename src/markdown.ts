@@ -121,6 +121,13 @@ export function convertTableToBullets(text: string): string {
 export function formatMessage(content: string): string {
   if (!content) return content;
 
+  // Security (w1 review): strip C0 control chars EXCEPT \n (and \t for tables).
+  // The Bot API rejects U+0000 in sendMessage, so a hostile caption containing
+  // NUL would otherwise make every reply to that chat fail silently.
+  // eslint-disable-next-line no-control-regex
+  content = content.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+  if (!content) return content;
+
   const placeholders = new Map<string, string>();
   let counter = 0;
   const ph = (value: string): string => {

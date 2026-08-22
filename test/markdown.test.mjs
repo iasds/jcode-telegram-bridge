@@ -110,8 +110,10 @@ test("P-05: multiple distinct indices inside one value all resolve", () => {
 });
 
 test("P-05: foreign placeholder-looking tokens are left verbatim (no crash)", () => {
+  // w1 security change: NUL controls are stripped before the pipeline, so the
+  // PH-looking token survives but without its \x00 sentinels.
   const input = "before\u0000PH999\u0000after";
-  assert.equal(formatMessage(input), input);
+  assert.equal(formatMessage(input), "beforePH999after");
 });
 
 test("P-05: many protected spans over a large document stay verbatim and fast", () => {
@@ -134,10 +136,19 @@ test("P-05: many protected spans over a large document stay verbatim and fast", 
 // model output, file names, error messages. None may break MarkdownV2 parse.
 
 test("injection: caption full of mdv2 specials stays escaped (no parse break)", () => {
-  const evil = "*_~`[]()#!+-=|{}.\\ all the specials_*~";
+  const evil = "*_~[]()#!+-=|{}. all the specials";
   const out = formatMessage(evil);
-  // Every structural char outside protected spans is escaped; telegram must accept it.
-  assert.doesNotMatch(out, /(?<!\\)\*\*[^*]+\*\*/); // no accidental bold pairs left unconverted
+  // Concrete escapes: every structural char in the input must be backslash-
+  // escaped in the output (strong assertion: fails if escaping is disabled).
+  for (const ch of ["*", "_", "~", "[", "]", "(", ")", "#", "!", "+", "-", "=", "|", "{", "}", "."]) {
+    assert.ok(out.includes("\\" + ch), `expected \\\\${ch} in output: ${out}`);
+  }
+});
+
+test("injection: C0 control chars are stripped (Bot API rejects NUL -> reply DoS)", () => {
+  const out = formatMessage("hello\u0000world\u0007");
+  assert.equal(out, "helloworld"); // no NUL/BEL survives; newline/tab preserved
+  assert.equal(formatMessage("a\nb"), "a\nb");
 });
 
 test("injection: unbalanced markdown cannot crash or leak structure", () => {
@@ -159,8 +170,11 @@ test("injection: transcript with link syntax renders as literal-ish safe text", 
   assert.match(out, /^\[click\]\(http:\/\/evil\)$/);
 });
 
-test("injection: control chars and zero-width do not corrupt placeholder restore", () => {
+test("injection: zero-width and stripped controls do not corrupt placeholder restore", () => {
   const s = "x`.b\u200by`z\u0000 tail";
   const out = formatMessage(s);
-  assert.ok(out.includes("\u200by") || out.includes("y"), "zwsp content survives");
+  // inline code span protected verbatim; NUL stripped; tail text intact
+  assert.match(out, /`\.b\u200by`/);
+  assert.ok(out.endsWith("z tail"));
+  assert.ok(!out.includes("\u0000"));
 });

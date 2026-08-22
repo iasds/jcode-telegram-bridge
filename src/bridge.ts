@@ -1,7 +1,8 @@
 import { JcodeClient, HarnessError } from "@1jehuang/jcode-sdk";
 import { Telegraf } from "telegraf";
 import https from "node:https";
-import { readFileSync, readdirSync, statSync, unlinkSync, existsSync } from "node:fs";
+import { chmodSync, readFileSync, readdirSync, statSync, unlinkSync, existsSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join, dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { loadConfig } from "./config.js";
@@ -546,9 +547,13 @@ async function downloadTelegramFile(fileId: string): Promise<{ path: string; ext
   writeFileSync(tmpPath, buf, { mode: 0o600 });
   // durable copy for the agent (tmp is deleted after STT; hermes keeps download dir)
   const durableDir = join(cfg.workDir, ".jcode-media", "telegram-voice");
-  try { mkdirSync(durableDir, { recursive: true, mode: 0o700 }); } catch {}
+  try {
+    mkdirSync(durableDir, { recursive: true, mode: 0o700 });
+    // w1 review: mode only applies to newly-created leaves; force pre-existing dirs too.
+    chmodSync(durableDir, 0o700);
+  } catch {}
   const rawBase = (file.file_path.split("/").pop() ?? `voice-${Date.now()}${ext}`).split("?")[0];
-  const durableName = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}-${baseName(rawBase)}`;
+  const durableName = `${Date.now()}-${randomBytes(6).toString("hex")}-${baseName(rawBase)}`;
   const finalDurable = durableName.includes(".") ? durableName : `${durableName}${ext}`;
   const durablePath = join(durableDir, finalDurable);
   try { writeFileSync(durablePath, buf, { mode: 0o600 }); } catch (e) { console.error("[bridge] durable write failed:", e); }
