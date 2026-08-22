@@ -542,15 +542,16 @@ async function downloadTelegramFile(fileId: string): Promise<{ path: string; ext
   const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`HTTP ${res.status} downloading voice`);
   const buf = Buffer.from(await res.arrayBuffer());
-  writeFileSync(tmpPath, buf);
+  // Voice content is private user data: 0600 file / 0700 dir, never world-readable.
+  writeFileSync(tmpPath, buf, { mode: 0o600 });
   // durable copy for the agent (tmp is deleted after STT; hermes keeps download dir)
   const durableDir = join(cfg.workDir, ".jcode-media", "telegram-voice");
-  try { mkdirSync(durableDir, { recursive: true }); } catch {}
+  try { mkdirSync(durableDir, { recursive: true, mode: 0o700 }); } catch {}
   const rawBase = (file.file_path.split("/").pop() ?? `voice-${Date.now()}${ext}`).split("?")[0];
   const durableName = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}-${baseName(rawBase)}`;
   const finalDurable = durableName.includes(".") ? durableName : `${durableName}${ext}`;
   const durablePath = join(durableDir, finalDurable);
-  try { writeFileSync(durablePath, buf); } catch (e) { console.error("[bridge] durable write failed:", e); }
+  try { writeFileSync(durablePath, buf, { mode: 0o600 }); } catch (e) { console.error("[bridge] durable write failed:", e); }
   return { path: tmpPath, ext, durablePath };
 }
 

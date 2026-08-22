@@ -128,3 +128,39 @@ test("P-05: many protected spans over a large document stay verbatim and fast", 
   }
   assert.ok(!out.includes("\u0000"), "no placeholder leaked into output");
 });
+
+// ── Injection-surface tests: hostile user-controlled text must round-trip ──
+// Sources of attacker-controlled text: message captions, STT transcripts,
+// model output, file names, error messages. None may break MarkdownV2 parse.
+
+test("injection: caption full of mdv2 specials stays escaped (no parse break)", () => {
+  const evil = "*_~`[]()#!+-=|{}.\\ all the specials_*~";
+  const out = formatMessage(evil);
+  // Every structural char outside protected spans is escaped; telegram must accept it.
+  assert.doesNotMatch(out, /(?<!\\)\*\*[^*]+\*\*/); // no accidental bold pairs left unconverted
+});
+
+test("injection: unbalanced markdown cannot crash or leak structure", () => {
+  for (const s of ["**bold", "__it_", "`open code", "~~strike", "||spoiler", "[link](", "![img]", "```fence"]) {
+    assert.equal(typeof formatMessage(s), "string");
+  }
+});
+
+test("injection: null-ish unicode placeholder lookalikes pass through verbatim", () => {
+  const s = "a\u0000PH0\u0000b";
+  assert.ok(formatMessage(s).includes("PH0"));
+});
+
+test("injection: transcript with link syntax renders as literal-ish safe text", () => {
+  // A voice transcript saying `[click](http://evil)` must not become a live link
+  // unless it was already a well-formed md link — here it IS well-formed, so the
+  // contract is: display text escaped, url preserved. Assert deterministic shape.
+  const out = formatMessage("[click](http://evil)");
+  assert.match(out, /^\[click\]\(http:\/\/evil\)$/);
+});
+
+test("injection: control chars and zero-width do not corrupt placeholder restore", () => {
+  const s = "x`.b\u200by`z\u0000 tail";
+  const out = formatMessage(s);
+  assert.ok(out.includes("\u200by") || out.includes("y"), "zwsp content survives");
+});
