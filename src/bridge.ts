@@ -659,6 +659,15 @@ async function handleVoice(ctx: MediaContext, kind: "voice" | "audio" | "video_n
       console.log(`[stt] ${kind} -> ${res.provider} ${res.transcript.slice(0, 80)}…`);
       const withFile = durableVoicePath ? `${enriched}\n\n[attached audio file: ${durableVoicePath}]` : enriched;
       mediaDeliver(chatId, ctx, withFile);
+    } else if (res.success && !res.transcript.trim()) {
+      // Worker succeeded but heard no confident speech (silence/noise).
+      // Not a failure: hand the agent the "inaudible" placeholder so it can
+      // ask the user to resend; keep the durable audio anchor as usual.
+      console.warn(`[stt] ${kind} empty transcript (no confident speech) [${res.provider}]`);
+      const unavailableAnchor = durableVoicePath ?? tmpPath ?? undefined;
+      let enriched = enrichTextWithTranscript(caption, [""], unavailableAnchor);
+      if (durableVoicePath) enriched += `\n\n[attached audio file: ${durableVoicePath}]`;
+      mediaDeliver(chatId, ctx, enriched);
     } else {
       const errNote = res.error ?? "unknown error";
       console.warn(`[stt] ${kind} failed [${res.provider}]: ${errNote}`);
