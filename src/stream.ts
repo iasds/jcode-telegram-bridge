@@ -158,7 +158,7 @@ export class StreamingRenderer {
   }
 
   /** Tool boundary: finalize the current segment, emit the tool line, start fresh. */
-  async onToolStart(name: string): Promise<void> {
+  async onToolStart(name: string, argPreview = ""): Promise<void> {
     if (this.failed) return;
     if (this.accumulated.trim()) {
       await this.edit(formatMessage(this.accumulated), true);
@@ -166,7 +166,8 @@ export class StreamingRenderer {
     // Tool line: reuse 429 backoff (same as edit/sendChunk) so a flood on
     // tool lines doesn't silently drop the line.
     {
-      const text = `${toolEmoji(name)} [${formatMessage(name)}]`;
+      const p = argPreview.replace(/\s+/g, " ").trim().slice(0, 100);
+      const text = `${toolEmoji(name)} [${formatMessage(name)}]${p ? " " + formatMessage(p) : ""}`;
       for (let attempt = 0; ; attempt++) {
         try {
           await this.bot.telegram.sendMessage(this.chatId, text);

@@ -480,6 +480,10 @@ async function telegramFetch(url: string, signal?: AbortSignal): Promise<FetchLi
   });
 }
 
+// tool_input_delta waiters: call_id -> resolver for the first input chunk,
+// used to show a command preview on the streaming tool line.
+const inputWaiters = new Map<string, (s: string) => void>();
+
 let botUsername: string | undefined;
 
 function allowed(fromId: number | undefined): boolean {
@@ -982,7 +986,23 @@ async function route(ctx: any, text: string): Promise<void> {
             if (stream && !stream.failed) await stream.onDelta(ev.text);
           } else if (ev.ev === "tool_start") {
             const name = (ev as { name?: string }).name ?? "tool";
-            if (stream && !stream.failed) await stream.onToolStart(name);
+            const callId = (ev as { call_id?: string }).call_id;
+            // Give the input a short window to arrive so the tool line can
+            // show a command preview; fall back to name-only after 400ms.
+            let preview = "";
+            if (callId) {
+              preview = await Promise.race([
+                new Promise<string>((resolve) => {
+                  const t = setTimeout(() => { inputWaiters.delete(callId); resolve(""); }, 400);
+                  inputWaiters.set(callId, (s: string) => { clearTimeout(t); inputWaiters.delete(callId); resolve(s); });
+                }),
+              ]);
+            }
+            if (stream && !stream.failed) await stream.onToolStart(name, preview);
+          } else if (ev.ev === "tool_input_delta") {
+            const cid = (ev as { call_id?: string }).call_id;
+            const w = cid ? inputWaiters.get(cid) : undefined;
+            if (w) w((ev as { delta?: string }).delta ?? "");
           }
         }
         console.log("[stream] loop end, events:", evCount, "failed:", stream?.failed);
