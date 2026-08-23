@@ -402,21 +402,83 @@ class HttpsProxyAgent extends https.Agent {
   }
 }
 
+// Shared connection pool for every api.telegram.org request. When
+// BRIDGE_HTTPS_PROXY is unset this is a plain keep-alive agent; when set it is
+// the CONNECT-tunnelling agent below. Both telegraf AND our own native-fetch
+// replacements (telegramFetch) must share it: undici's global fetch ignores
+// https.Agents entirely, so direct fetch() bypasses the proxy.
+const telegramAgent: https.Agent = (() => {
+  const proxyUrl = process.env.BRIDGE_HTTPS_PROXY?.trim();
+  if (!proxyUrl) {
+    return new https.Agent({ keepAlive: true, timeout: 60_000, keepAliveMsecs: 10_000 });
+  }
+  const u = new URL(proxyUrl);
+  if (u.protocol !== "http:" || !u.hostname) {
+    throw new Error(`BRIDGE_HTTPS_PROXY must be an http:// URL, got: ${proxyUrl}`);
+  }
+  return new HttpsProxyAgent(u, { keepAlive: true, timeout: 60_000, keepAliveMsecs: 10_000 });
+})();
+
 const bot = new Telegraf(cfg.botToken, {
   telegram: {
-    agent: (() => {
-      const proxyUrl = process.env.BRIDGE_HTTPS_PROXY?.trim();
-      if (!proxyUrl) {
-        return new https.Agent({ keepAlive: true, timeout: 60_000, keepAliveMsecs: 10_000 });
-      }
-      const u = new URL(proxyUrl);
-      if (u.protocol !== "http:" || !u.hostname) {
-        throw new Error(`BRIDGE_HTTPS_PROXY must be an http:// URL, got: ${proxyUrl}`);
-      }
-      return new HttpsProxyAgent(u, { keepAlive: true, timeout: 60_000, keepAliveMsecs: 10_000 });
-    })(),
+    agent: telegramAgent,
   },
 });
+
+/** Minimal subset of the fetch Response API we actually consume. */
+interface FetchLikeResponse {
+  ok: boolean;
+  status: number;
+  text(): Promise<string>;
+  json(): Promise<unknown>;
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+async function readBodyToBuffer(res: import("node:http").IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of res) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks);
+}
+
+/**
+ * fetch()-shaped GET that honors BRIDGE_HTTPS_PROXY via telegramAgent.
+ *
+ * Node's built-in fetch (undici) does NOT support https.Agents or HTTP
+ * CONNECT proxies, so on hosts where Telegram is only reachable through a
+ * local proxy (e.g. the K50 bridge behind mihomo), plain fetch() always fails
+ * while telegraf (which takes an agent) succeeds. All Telegram API calls that
+ * used to be bare fetch() go through here instead.
+ */
+async function telegramFetch(url: string, signal?: AbortSignal): Promise<FetchLikeResponse> {
+  if (!process.env.BRIDGE_HTTPS_PROXY?.trim()) return fetch(url, { signal });
+  return new Promise<FetchLikeResponse>((resolve, reject) => {
+    let settled = false;
+    const req = https.request(url, { agent: telegramAgent, method: "GET" }, (res) => {
+      const status = res.statusCode ?? 0;
+      settled = true;
+      resolve({
+        ok: status >= 200 && status < 300,
+        status,
+        text: async () => (await readBodyToBuffer(res)).toString("utf8"),
+        json: async () => JSON.parse((await readBodyToBuffer(res)).toString("utf8")),
+        arrayBuffer: async () => {
+          const buf = await readBodyToBuffer(res);
+          return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
+        },
+      });
+    });
+    // Map the caller's AbortSignal onto socket destruction, mirroring fetch().
+    if (signal) {
+      const onAbort = () => req.destroy(signal.reason instanceof Error ? signal.reason : new Error("The operation was aborted"));
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+    req.on("error", (err) => {
+      if (!settled) reject(err);
+    });
+    req.end();
+  });
+}
 
 let botUsername: string | undefined;
 
@@ -565,7 +627,7 @@ async function handleDocument(ctx: MediaContext): Promise<void> {
   try {
     const f = await ctx.telegram.getFile(doc.file_id);
     if (!f.file_path) throw new Error("no file_path");
-    const res = await fetch(`https://api.telegram.org/file/bot${cfg.botToken}/${f.file_path}`, { signal: AbortSignal.timeout(15_000) });
+    const res = await telegramFetch(`https://api.telegram.org/file/bot${cfg.botToken}/${f.file_path}`, AbortSignal.timeout(15_000));
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const content = await res.text();
     mediaDeliver(
@@ -629,7 +691,7 @@ async function downloadTelegramFile(fileId: string): Promise<{ path: string; ext
   const { writeFileSync, mkdirSync } = await import("node:fs");
   const tmpPath = join(getTmpdir(), `jcode-voice-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
   const url = `https://api.telegram.org/file/bot${cfg.botToken}/${file.file_path}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+  const res = await telegramFetch(url, AbortSignal.timeout(15_000));
   if (!res.ok) throw new Error(`HTTP ${res.status} downloading voice`);
   const buf = Buffer.from(await res.arrayBuffer());
   // Voice content is private user data: 0600 file / 0700 dir, never world-readable.
@@ -1055,7 +1117,7 @@ async function getUpdatesRaw(
   signal: AbortSignal,
 ): Promise<{ update_id: number }[]> {
   const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&timeout=15&allowed_updates=`;
-  const res = await fetch(url, { signal });
+  const res = await telegramFetch(url, signal);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = (await res.json()) as { ok: boolean; result?: { update_id: number }[]; description?: string };
   if (!data.ok) throw new Error(data.description ?? "getUpdates failed");
