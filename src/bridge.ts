@@ -977,9 +977,12 @@ async function route(ctx: any, text: string): Promise<void> {
         turnStarted = true;
         console.log("[stream] consuming events");
         let evCount = 0;
+        const kindsSeen = new Set<string>();
         for await (const ev of child.events(st.sessionId)) {
           if (ac.signal.aborted) break;
           evCount++;
+          if (!kindsSeen.has(ev.ev)) console.log(`[stream] kind#${evCount}: ${ev.ev}`);
+          kindsSeen.add(ev.ev);
           if (ev.ev === "turn_done") { console.log("[stream] turn_done, events:", evCount); break; }
           if (ev.ev === "text_delta") {
             accumulated += ev.text;
@@ -1002,10 +1005,13 @@ async function route(ctx: any, text: string): Promise<void> {
           } else if (ev.ev === "tool_input_delta") {
             const cid = (ev as { call_id?: string }).call_id;
             const w = cid ? inputWaiters.get(cid) : undefined;
-            if (w) w((ev as { delta?: string }).delta ?? "");
+            if (w) {
+              const d = ev as { delta?: string; text?: string };
+              w(d.delta ?? d.text ?? "");
+            }
           }
         }
-        console.log("[stream] loop end, events:", evCount, "failed:", stream?.failed);
+        console.log("[stream] loop end, events:", evCount, "failed:", stream?.failed, "kinds:", [...kindsSeen].join(","));
         if (ac.signal.aborted) {
           // /cancel with a clean events() close: finalize the partial text
           // (drop the ▉ cursor) and report once.

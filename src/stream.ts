@@ -194,7 +194,18 @@ export class StreamingRenderer {
   /** Turn end: finalize with MarkdownV2, chunked over 4096, no cursor. */
   async finish(): Promise<void> {
     if (this.cancelled || this.msgId === undefined) return;
-    const text = this.accumulated.trim() || "*(no output)*";
+    // A turn that ends on a tool call has no trailing text: the cursor
+    // message is still empty, so just remove it instead of editing it into
+    // "(no output)" (which showed up as a stray black block after replies).
+    if (!this.accumulated.trim()) {
+      try {
+        await this.bot.telegram.deleteMessage(this.chatId, this.msgId);
+      } catch (err) {
+        console.error("[stream] cursor cleanup failed:", err);
+      }
+      return;
+    }
+    const text = this.accumulated.trim();
     const chunks = truncateMessage(formatMessage(text));
     await this.edit(chunks[0], true);
     for (let i = 1; i < chunks.length; i++) {
