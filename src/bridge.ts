@@ -2,6 +2,8 @@ import { JcodeClient, HarnessError } from "@1jehuang/jcode-sdk";
 import { Telegraf } from "telegraf";
 import type { Telegram } from "telegraf";
 import https from "node:https";
+import http from "node:http";
+import tls from "node:tls";
 import { chmodSync, readFileSync, readdirSync, statSync, unlinkSync, existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join, dirname } from "node:path";
@@ -359,9 +361,60 @@ const hooks: BridgeHooks = {
 // telegraf's own request timeout is hardcoded to 500s, which would leave the
 // bridge deaf to Telegram for minutes. On socket timeout the getUpdates call
 // rejects, polling stops, launch() rejects, and fatalExit restarts via systemd.
+//
+// BRIDGE_HTTPS_PROXY: when set (e.g. http://127.0.0.1:7890), route all
+// Telegram API traffic through an HTTP CONNECT proxy. Needed where
+// api.telegram.org is not directly reachable and there is no transparent
+// proxy (e.g. running on a phone behind a local mihomo instance).
+class HttpsProxyAgent extends https.Agent {
+  private readonly proxyHost: string;
+  private readonly proxyPort: number;
+
+  constructor(proxy: URL, options: https.AgentOptions = {}) {
+    super(options);
+    this.proxyHost = proxy.hostname;
+    this.proxyPort = proxy.port ? Number(proxy.port) : 80;
+  }
+
+  override createConnection(
+    options: { host?: string; port?: number },
+    callback: (err: Error | null, stream: import("node:stream").Duplex) => void,
+  ): import("node:stream").Duplex | null {
+    const host = options.host ?? "api.telegram.org";
+    const port = options.port ?? 443;
+    const req = http.request({
+      host: this.proxyHost,
+      port: this.proxyPort,
+      method: "CONNECT",
+      path: `${host}:${port}`,
+      headers: { Host: `${host}:${port}` },
+    });
+    let result: import("node:stream").Duplex | null = null;
+    req.on("connect", (_res, socket) => {
+      // Hand the tunnelled socket to tls for the TLS handshake.
+      const tlsSocket = tls.connect({ socket, servername: host, host, port });
+      callback(null, tlsSocket);
+      result = tlsSocket;
+    });
+    req.on("error", (err) => callback(err, undefined as never));
+    req.end();
+    return result;
+  }
+}
+
 const bot = new Telegraf(cfg.botToken, {
   telegram: {
-    agent: new https.Agent({ keepAlive: true, timeout: 60_000, keepAliveMsecs: 10_000 }),
+    agent: (() => {
+      const proxyUrl = process.env.BRIDGE_HTTPS_PROXY?.trim();
+      if (!proxyUrl) {
+        return new https.Agent({ keepAlive: true, timeout: 60_000, keepAliveMsecs: 10_000 });
+      }
+      const u = new URL(proxyUrl);
+      if (u.protocol !== "http:" || !u.hostname) {
+        throw new Error(`BRIDGE_HTTPS_PROXY must be an http:// URL, got: ${proxyUrl}`);
+      }
+      return new HttpsProxyAgent(u, { keepAlive: true, timeout: 60_000, keepAliveMsecs: 10_000 });
+    })(),
   },
 });
 
