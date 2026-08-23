@@ -480,9 +480,9 @@ async function telegramFetch(url: string, signal?: AbortSignal): Promise<FetchLi
   });
 }
 
-// tool_input_delta waiters: call_id -> resolver for the first input chunk,
-// used to show a command preview on the streaming tool line.
-const inputWaiters = new Map<string, (s: string) => void>();
+// First tool_input_delta chunk per call_id, captured non-blockingly to
+// build the command preview shown on streaming tool lines.
+const pendingPreviews = new Map<string, string>();
 
 let botUsername: string | undefined;
 
@@ -990,25 +990,23 @@ async function route(ctx: any, text: string): Promise<void> {
           } else if (ev.ev === "tool_start") {
             const name = (ev as { name?: string }).name ?? "tool";
             const callId = (ev as { call_id?: string }).call_id;
-            // Give the input a short window to arrive so the tool line can
-            // show a command preview; fall back to name-only after 400ms.
-            let preview = "";
-            if (callId) {
-              preview = await Promise.race([
-                new Promise<string>((resolve) => {
-                  const t = setTimeout(() => { inputWaiters.delete(callId); resolve(""); }, 400);
-                  inputWaiters.set(callId, (s: string) => { clearTimeout(t); inputWaiters.delete(callId); resolve(s); });
-                }),
-              ]);
+            // Send the tool line after a short delay so a fast-following
+            // tool_input_delta can supply a command preview. Do NOT await
+            // here: events() only advances while this loop spins, so an
+            // inline wait deadlocks the very delta we are waiting for.
+            if (stream) {
+              const s = stream;
+              setTimeout(() => {
+                const p = (callId ? pendingPreviews.get(callId) : undefined) ?? "";
+                if (callId) pendingPreviews.delete(callId);
+                void s.onToolStart(name, p);
+              }, 300);
             }
-            if (stream && !stream.failed) await stream.onToolStart(name, preview);
           } else if (ev.ev === "tool_input_delta") {
             const cid = (ev as { call_id?: string }).call_id;
-            const w = cid ? inputWaiters.get(cid) : undefined;
-            if (w) {
-              const d = ev as { delta?: string; text?: string };
-              w(d.delta ?? d.text ?? "");
-            }
+            const d = ev as { delta?: string; text?: string };
+            const chunk = d.delta ?? d.text ?? "";
+            if (cid && chunk && !pendingPreviews.has(cid)) pendingPreviews.set(cid, chunk);
           }
         }
         console.log("[stream] loop end, events:", evCount, "failed:", stream?.failed, "kinds:", [...kindsSeen].join(","));
