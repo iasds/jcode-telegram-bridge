@@ -480,9 +480,15 @@ async function telegramFetch(url: string, signal?: AbortSignal): Promise<FetchLi
   });
 }
 
-// First tool_input_delta chunk per call_id, captured non-blockingly to
-// build the command preview shown on streaming tool lines.
-const pendingPreviews = new Map<string, string>();
+// Hermes-style pending tool line: the next tool_input_delta after a
+// tool_start fills the preview regardless of call_id matching (frames in
+// practice do not reliably carry matching ids).
+interface PendingToolLine {
+  name: string;
+  preview: string;
+  timer: ReturnType<typeof setTimeout>;
+}
+let pendingToolLine: PendingToolLine | null = null;
 
 let botUsername: string | undefined;
 
@@ -977,6 +983,7 @@ async function route(ctx: any, text: string): Promise<void> {
         turnStarted = true;
         console.log("[stream] consuming events");
         let evCount = 0;
+        let dbgDeltaLogged = false;
         const kindsSeen = new Set<string>();
         for await (const ev of child.events(st.sessionId)) {
           if (ac.signal.aborted) break;
@@ -989,24 +996,38 @@ async function route(ctx: any, text: string): Promise<void> {
             if (stream && !stream.failed) await stream.onDelta(ev.text);
           } else if (ev.ev === "tool_start") {
             const name = (ev as { name?: string }).name ?? "tool";
-            const callId = (ev as { call_id?: string }).call_id;
             // Send the tool line after a short delay so a fast-following
             // tool_input_delta can supply a command preview. Do NOT await
-            // here: events() only advances while this loop spins, so an
-            // inline wait deadlocks the very delta we are waiting for.
+            // here: events() only advances while this loop spins.
             if (stream) {
               const s = stream;
-              setTimeout(() => {
-                const p = (callId ? pendingPreviews.get(callId) : undefined) ?? "";
-                if (callId) pendingPreviews.delete(callId);
-                void s.onToolStart(name, p);
-              }, 300);
+              const entry: PendingToolLine = {
+                name,
+                preview: "",
+                timer: setTimeout(() => {
+                  if (pendingToolLine === entry) pendingToolLine = null;
+                  void s.onToolStart(name, entry.preview);
+                }, 500),
+              };
+              pendingToolLine = entry;
             }
           } else if (ev.ev === "tool_input_delta") {
-            const cid = (ev as { call_id?: string }).call_id;
-            const d = ev as { delta?: string; text?: string };
+            const d = ev as { delta?: string; text?: string; call_id?: string };
             const chunk = d.delta ?? d.text ?? "";
-            if (cid && chunk && !pendingPreviews.has(cid)) pendingPreviews.set(cid, chunk);
+            if (!dbgDeltaLogged) {
+              dbgDeltaLogged = true;
+              console.log("[stream] delta sample:", JSON.stringify(ev).slice(0, 220));
+            }
+            if (pendingToolLine && chunk.trim()) {
+              pendingToolLine.preview += chunk;
+              // Send as soon as we have real content past JSON scaffolding.
+              if (pendingToolLine.preview.replace(/[\s{}\[\]",:]/g, "").length >= 4) {
+                clearTimeout(pendingToolLine.timer);
+                const e = pendingToolLine;
+                pendingToolLine = null;
+                void stream?.onToolStart(e.name, e.preview);
+              }
+            }
           }
         }
         console.log("[stream] loop end, events:", evCount, "failed:", stream?.failed, "kinds:", [...kindsSeen].join(","));
